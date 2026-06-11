@@ -1,0 +1,354 @@
+{
+  "minUsd": 10000,
+  "pctThreshold": 0.2,
+  "watch": [
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0x0fb0e40cec3bb23e13abc585958a93c796fbea56955e19a23727a716a0423239",
+      "label": "USDC/USDT (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0x3b1b1f2e775a6db1664f8e7d59ad568605ea2406312c11aef03146c0cf89d5b9",
+      "label": "USDT/USDS (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+      "label": "USDC/WETH (Uniswap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0xa632d59b9b804a956bfaa9b48af3a1b74808fc1f",
+      "label": "PYUSD/USDS (Curve)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0x05fa420e4b205136acee67ba5121abd2f94b6365",
+      "label": "WETH/PEPE (Uniswap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+      "label": "SOL/USDC (Orca)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "8sjV1AqBFvFuADBCQHhotaRq5DFFYSjjg1jMyVWMqXvZ",
+      "label": "USDT/USDC (Manifest)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "GVJfHJsvrsWZmVj2JVQ3KyY1n7azyi8Z2FdBPxucUe58",
+      "label": "PYUSD/USDC (Manifest)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "EXMcKF76kmBUH8xZ5fi1jv3ezh3eVQCeL4rQbpjCRxvF",
+      "label": "USDG/USDC (Manifest)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM",
+      "label": "cbBTC/USDC (Orca)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59",
+      "label": "WETH/USDC (Aerodrome SlipStream)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0x4e962bb3889bf030368f56810a9c96b83cb3e778",
+      "label": "USDC/cbBTC (Aerodrome SlipStream)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0x70acdf2ad0bf2402c957154f944c19ef4e1cbae1",
+      "label": "WETH/cbBTC (Aerodrome SlipStream)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0xa41bc0affba7fd420d186b84899d7ab2ac57fcd1",
+      "label": "USDC/USDT (Aerodrome SlipStream)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0xf1cacd7e005b9337c58aae77bc88d93c635cdf4d",
+      "label": "USDC/PLAY (PancakeSwap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0x172fcd41e0913e95784454622d1c3724f546f849",
+      "label": "USDT/WBNB (PancakeSwap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0x46cf1cf8c69595804ba91dfdd8d6b960c9b0a7c4",
+      "label": "USDT/BTCB (PancakeSwap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0xf2688fb5b81049dfb7703ada5e770543770612c4",
+      "label": "USDC/WBNB (PancakeSwap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0x916f992df86795f24de6c268cfb9031fbb1155da",
+      "label": "UB/USDC (PancakeSwap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0x9f8f4615ff5143aee365fa34f34196fb85be7650",
+      "label": "USDT/FF (PancakeSwap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "arbitrum",
+      "address": "0xc6962004f452be9203591991d15f6b388e09e8d0",
+      "label": "WETH/USDC (Uniswap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "arbitrum",
+      "address": "0x2f5e87c9312fa29aed5c179e456625d79015299c",
+      "label": "WBTC/WETH (Uniswap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "arbitrum",
+      "address": "0x0e4831319a50228b9e450861297ab92dee15b44f",
+      "label": "WBTC/USDC (Uniswap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "arbitrum",
+      "address": "0x5969efdde3cf5c0d9a88ae51e47d721096a97203",
+      "label": "WBTC/USD\u20ae0 (Uniswap V3)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "arbitrum",
+      "address": "0xab05003a63d2f34ac7eec4670bca3319f0e3d2f62af5c2b9cbd69d03fd804fd2",
+      "label": "USDC/USD\u20ae0 (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "sui",
+      "address": "0xb8a67c149fd1bc7f9aca1541c61e51ba13bdded64c273c278e50850ae3bff073",
+      "label": "USDC/USDT (Cetus)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "sui",
+      "address": "0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105",
+      "label": "USDC/SUI (Cetus)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "sui",
+      "address": "0x968f1f73b8e766e2ce0198c807d0c956aa384bfe64c98a18e56bfb970a13e7bb",
+      "label": "US/USDC (Cetus)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "sui",
+      "address": "0x7665f3a76ea9bb923556906a4d8ba8d98aa59776b7f098300758fe75d161a42c",
+      "label": "LBTC/USDC (Momentum)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "sui",
+      "address": "0x919a34b9df1d7a56fa078ae6ddc6bd203e284974704d85721062d38ee3a6701a",
+      "label": "WAL/SUI (Momentum)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "FEroVA2jgHmkv5TSocxUHR4R5qD1P5M7WiGgtmCuSo15",
+      "label": "SOL/FIT (Pump.fun)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "4bknQpHsiZUFYxagiZmCkGw7JK2zah6QcVVspuXw59NJ",
+      "label": "SOL/MYTH (Pump.fun)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "Dx9XMQyZ3dXZKo6xqGvsGC5yjUW3WpEqoFsZ8uWD9uSp",
+      "label": "POKES/SOL (PumpSwap)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "FkT7RjXb9BWt6swMghmdD6PZX4YkNTDXYFAUtzazpjX8",
+      "label": "SOL/Navi (Pump.fun)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "HDekcnyvenvkrQAMhxrH9SVY4o8mtSNVGHSkSAU8tCvK",
+      "label": "SOL/PUMPTOWN (Pump.fun)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "DAJGWUZpGfpmaWDBZDLNVNaSQP7rtreZLpnLzf6nwZPW",
+      "label": "SOL/Lyhanna (Pump.fun)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "xueuW1NNb7xpZFP9N9TyEsBaZXE3epbryKNULFGnqMX",
+      "label": "SOL/MOO (Pump.fun)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "solana",
+      "address": "H9kEaTaJxS2hnBWP2EL9NKChLKLWUzm6p5x5UCcgh9p9",
+      "label": "SOL/F2026 (PumpSwap)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0x8b470b2d795e5d5730f4a08937a6c924133b12fa9a67c12502e5657dbf99cedf",
+      "label": "WETH/INPAY (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0xd63abcb2686e7bfa077695829db419357136b01172c7415d8c6c3cdf83be5381",
+      "label": "ETH/Bru (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0xc1a029e80382254b2cf7fc1931a2c25d8209d86c0822b13c6161240555447bc6",
+      "label": "ETH/MGT (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0xa284dc417d85e8a7ac85ac53b66586945110304f0fc2ab2921472056e9584ad4",
+      "label": "WETH/Lyhanna (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0x43d751800d024e540069c18688214395c77c33dc0a376c1326e27762876cf7db",
+      "label": "ARCADIA/WETH (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0x06ff66bd4383640440e84c04af41c6c1a372e80d96e791bfefe4bd425120056d",
+      "label": "WETH/Jotchunc (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0x7c871407246a3e0376bcf1621c3643b1c31b09886577e55b46dcb94af9d08389",
+      "label": "WETH/GF (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "base",
+      "address": "0xd6ca04c2d4203d85ef5988aa2ea6ff6071f69e39172c39222eeee8f0ee4493eb",
+      "label": "ETH/Polygraph (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0x3df6eefb162ddbf18f8130d5b22124b51c3d986b",
+      "label": "WBNB/\u94f6\u884c\u9a6c\u65af (PancakeSwap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0x4ca601950aaf7d89ac6fcbd3747be16e7e666c5e",
+      "label": "\u6c34\u74f6\u5ea7\ud83d\udc32/WBNB (PancakeSwap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0xbfbded75c4b988aeef055cc88aa7ffd7f0a338df",
+      "label": "FX/WBNB (PancakeSwap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0xcaa460d230827b53315cc8b25f582098a3b3cad2",
+      "label": "SWI/WBNB (PancakeSwap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "bsc",
+      "address": "0xfc5c2c0bf735eb262f5e5adb811d1f8f910fd9d6",
+      "label": "SAT/WBNB (PancakeSwap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0xe46560b57c19c1ab33dec4d8baf72719a95173e015d5bc50caf8a6fdf098175a",
+      "label": "ETH/Tori (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0xaebfaeb79d9a4052c6754d80f6f3ccd8a678f381bed75b9f2c546b6f80a54d3c",
+      "label": "WETH/ASTEROID (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0x3169703f0872866d278106156efd3896f1ea79cbc88d09e77ed913c411d0ecb8",
+      "label": "ETH/WCUP (Uniswap V4)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0xd35528cf4c6d0ccca427911d7384508c141a3b05",
+      "label": "STARGRACE/WETH (Uniswap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0xcda5b49480ba6123b8ea724d2c05d50d55b14f0c",
+      "label": "Liv's Stargrace Foundation/WETH (Uniswap V2)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "arbitrum",
+      "address": "0xac0ce0ccaacf4121b0e78fe094c67f24bf367f6a",
+      "label": "GENPL/USD\u20ae0 (SushiSwap)"
+    },
+    {
+      "method": "pool_reserves",
+      "chain": "arbitrum",
+      "address": "0x1627c2f693fe4b69719835a9c973702ff2508e9fc65d55e8c17d5dee89d30c35",
+      "label": "ETH/PENDLE (Uniswap V4)"
+    }
+  ]
+}

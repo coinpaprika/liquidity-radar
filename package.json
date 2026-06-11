@@ -1,0 +1,48 @@
+{
+  "name": "liquidity-radar",
+  "version": "0.1.0",
+  "description": "Open-source real-time DEX liquidity-drain detector, built on the free DexPaprika Reserve Stream API (no key, no KYC).",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coinpaprika/liquidity-radar.git"
+  },
+  "homepage": "https://dexpaprika.com",
+  "bugs": "https://github.com/coinpaprika/liquidity-radar/issues",
+  "bin": {
+    "liquidity-radar": "./dist/cli/src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "radar": "tsx cli/src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "prepare": "tsc -p tsconfig.json",
+    "start": "node dist/cli/src/index.js",
+    "dev:feed": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --import tsx --test core/test/sse.test.ts core/test/detect.test.ts core/test/config.test.ts core/test/coerce.test.ts core/test/webhook.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p feed/tsconfig.json"
+  },
+  "keywords": [
+    "defi",
+    "dex",
+    "liquidity",
+    "rug-pull",
+    "monitoring",
+    "sse",
+    "streaming",
+    "ethereum",
+    "solana",
+    "dexpaprika"
+  ],
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.0.0"
+  }
+}

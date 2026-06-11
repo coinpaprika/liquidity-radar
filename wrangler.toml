@@ -1,0 +1,32 @@
+name = "liquidity-radar-dexpaprika"
+main = "feed/src/index.ts"
+compatibility_date = "2025-05-01"
+
+[[durable_objects.bindings]]
+name = "RADAR"
+class_name = "RadarDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RadarDO"] # SQLite-backed: deploys on the free plan
+
+[triggers]
+crons = ["*/5 * * * *"] # bootstraps the DO after deploy, keeps it alive
+
+# Alerts go wherever you point WEBHOOK_URL (Discord webhooks are detected and
+# get Discord's shape; anything else receives {text, alert} JSON). Without it,
+# nothing leaves the worker — catches just show on the status page.
+#   wrangler secret put WEBHOOK_URL
+#
+# Default watchlist is bundled from ./watchlist.json at deploy time — edit
+# that one file, run `npx wrangler deploy`, done. To override without a
+# redeploy, set a WATCHLIST var/secret with the same JSON shape (~5KB cap).
+#
+# POST_SUFFIX is appended to every sent alert; defaults to a data-source
+# credit ("data: dexpaprika.com"). Set POST_SUFFIX = "" to disable.
+
+# Sending pace: per-pool cooldown and a global hourly cap, so a volatile
+# pool can't flood your channel.
+[vars]
+POST_COOLDOWN_MINUTES = "30"
+POSTS_PER_HOUR = "6"

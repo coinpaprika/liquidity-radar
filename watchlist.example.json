@@ -1,0 +1,18 @@
+{
+  "minUsd": 25000,
+  "pctThreshold": 0.1,
+  "watch": [
+    {
+      "method": "pool_reserves",
+      "chain": "ethereum",
+      "address": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+      "label": "USDC/WETH 0.05% (Uniswap v3)"
+    },
+    {
+      "method": "token_reserves",
+      "chain": "ethereum",
+      "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "label": "WETH"
+    }
+  ]
+}
