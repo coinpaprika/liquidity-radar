@@ -1,8 +1,8 @@
 # How LiquidityRadar works
 
 ```
-core/   the engine — subscribe, detect, emit alerts. Zero dependencies.
-feed/   Cloudflare Worker + Durable Object — the 24/7 alert feed
+core/   the engine: subscribe, detect, emit alerts. Zero dependencies.
+feed/   Cloudflare Worker + Durable Object, the 24/7 alert feed
 cli/    terminal frontend around core
 ```
 
@@ -12,20 +12,20 @@ browser.
 ## Data source
 
 All data comes from the [DexPaprika Reserve Stream API](https://docs.dexpaprika.com)
-(`streaming.dexpaprika.com/sse/reserves`) — free, no API key, no signup.
+(`streaming.dexpaprika.com/sse/reserves`). Free, no API key, no signup.
 Reserve changes arrive block-by-block as SSE events with USD deltas already
 computed server-side, so the client does no price math.
 
 Captured event shapes:
 
-`event: token_reserves` — one token across all its pools:
+`event: token_reserves`, one token across all its pools:
 ```json
 {"chain":"ethereum","token_id":"0xc02a…","reserve":"3243…","delta":"-1722…",
  "block":"25286202","price_usd":1618.74,"reserve_usd":525025172.27,
  "delta_usd":-27881.21,"updated_at":1781084315,"timestamp":1781084317}
 ```
 
-`event: pool_reserves` — one pool, per-token legs plus totals:
+`event: pool_reserves`, one pool with per-token legs plus totals:
 ```json
 {"chain":"ethereum","pool_id":"0x88e6…","block":"25286203","previous_block":"…",
  "tokens":[{"token_id":"…","delta_usd":46015.11,"reserve_usd":19396869.94}, …],
@@ -39,13 +39,13 @@ honest.
 ## Transport: one connection, up to 25 subscriptions
 
 The API multiplexes up to 25 subscriptions per POST connection and caps
-streams at 10 per IP. `createRadar` chunks the watchlist into ≤25 groups —
+streams at 10 per IP. `createRadar` chunks the watchlist into groups of 25 or fewer:
 a 58-pool watchlist uses 3 connections, not 58. Events route back to entries
 by `request_id` (the index in the POST array), with a chain+address fallback.
 
 Connection care, learned in production:
 
-- Backoff resets only after the first parsed SSE message — HTTP 200 alone
+- Backoff resets only after the first parsed SSE message, because HTTP 200 alone
   proves nothing (proxies can 200-and-close).
 - In-stream `error` events split two ways: capacity problems ("stream limit
   exceeded") retry with backoff; subscription problems ("token not found")
@@ -79,10 +79,10 @@ A single Durable Object holds the SSE connections (kept alive by a 30s alarm
 chain plus a 5-minute cron as bootstrap/backstop) and gates alerts before
 they reach your webhook:
 
-- fail-closed: without `WEBHOOK_URL` nothing leaves the worker — catches
+- fail-closed: without `WEBHOOK_URL` nothing leaves the worker; catches
   just accumulate on the status page
 - dedup on `subject:block:kind` (24h TTL), per-subject cooldown, global
-  hourly cap, and a pause honoring webhook 429s — so a volatile pool can't
+  hourly cap, and a pause honoring webhook 429s, so a volatile pool can't
   flood a channel
 - every catch persists to DO storage with a timestamp and shows on the
   status page, including the ones the gate skipped and why
@@ -91,7 +91,7 @@ they reach your webhook:
 
 ## What it costs to run
 
-CLI: nothing — the API is free and keyless. The 24/7 feed: an always-on DO
+CLI: nothing. The API is free and keyless. The 24/7 feed: an always-on DO
 uses ~10,800 GB-s/day, which fits Cloudflare's free plan (13,000 GB-s/day cap)
 with thin headroom; the $5/month Workers Paid plan is the comfortable choice.
 Watchlist size doesn't change the cost.

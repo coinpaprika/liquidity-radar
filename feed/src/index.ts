@@ -1,4 +1,4 @@
-// LiquidityRadar live feed — Cloudflare Worker + Durable Object.
+// LiquidityRadar live feed: Cloudflare Worker + Durable Object.
 //
 // Worker: edge-cached public status page + /health; a cron trigger bootstraps
 // the Durable Object after deploy and keeps it alive with no visitors.
@@ -6,7 +6,7 @@
 // per-subject cooldown, hourly cap, 429 pauses), sends them to your webhook,
 // renders the status page.
 //
-// Sending is fail-closed: without WEBHOOK_URL nothing leaves the worker —
+// Sending is fail-closed: without WEBHOOK_URL nothing leaves the worker;
 // catches just accumulate on the status page.
 
 import {
@@ -53,7 +53,7 @@ interface Stats {
   sinceMs: number;
 }
 
-const RECENT_CAP = 150; // ~60KB of a 128KB DO storage value — a busy night fits
+const RECENT_CAP = 150; // ~60KB of a 128KB DO storage value; a busy night fits
 
 interface Gate {
   posted: Record<string, number>; // dedup key -> ms timestamp
@@ -154,7 +154,7 @@ export class RadarDO {
 
     // thresholds define the experiment: when they change, the catch list and
     // counters restart so old-epoch noise doesn't pollute the readout (the
-    // posting gate survives — its cooldowns protect the X quota)
+    // posting gate survives; its cooldowns protect the X quota)
     const epoch = (await this.state.storage.get<string>("epoch")) ?? "";
     if (epoch !== this.thresholds) {
       await this.state.storage.put("epoch", this.thresholds);
@@ -198,8 +198,8 @@ export class RadarDO {
       this.configSource = `WATCHLIST var (${parsed.watch.length} entries)`;
       return parsed as RadarConfig;
     } catch (err) {
-      this.note(`WATCHLIST invalid — using bundled watchlist: ${String(err)}`);
-      this.configSource = "bundled watchlist.json (WATCHLIST var INVALID — fix it!)";
+      this.note(`WATCHLIST invalid, using bundled watchlist: ${String(err)}`);
+      this.configSource = "bundled watchlist.json (WATCHLIST var INVALID, fix it!)";
       return FALLBACK_WATCHLIST;
     }
   }
@@ -270,8 +270,8 @@ export class RadarDO {
     const now = Date.now();
     const live = isLive(this.env);
     const mode = live
-      ? "live — sending alerts to webhook"
-      : "watch-only (no WEBHOOK_URL — catches stay on this page)";
+      ? "live, sending alerts to webhook"
+      : "watch-only (no WEBHOOK_URL, catches stay on this page)";
     const lastEvent =
       this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
     const lastPost = gate.lastPostAtMs
@@ -308,7 +308,7 @@ export class RadarDO {
       .join("\n");
     return `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>LiquidityRadar</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px">
-<h1>LiquidityRadar — live</h1>
+<h1>LiquidityRadar (live)</h1>
 <p>Real-time DEX liquidity drains &amp; adds on the free DexPaprika reserve stream.</p>
 <p>mode: <strong>${escapeHtml(mode)}</strong> · watchlist: ${escapeHtml(this.configSource)}<br>
 ${escapeHtml(this.thresholds)}<br>
@@ -316,10 +316,10 @@ last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost
 <strong>${escapeHtml(totals)}</strong></p>
 ${paused}${postError}
 <h2>Recent catches</h2>
-<ul style="list-style:none;padding:0">${rows ? rows.replace(/<li>/g, '<li style="margin:10px 0">') : "<li>nothing caught yet — drains are rare by design</li>"}</ul>
+<ul style="list-style:none;padding:0">${rows ? rows.replace(/<li>/g, '<li style="margin:10px 0">') : "<li>nothing caught yet (drains are rare by design)</li>"}</ul>
 ${issues}
 <hr style="margin-top:32px;border:none;border-top:1px solid #ddd">
-<p style="color:#666">Powered by <a href="https://dexpaprika.com">DexPaprika</a> — free real-time DEX data, no API key needed ·
+<p style="color:#666">Powered by <a href="https://dexpaprika.com">DexPaprika</a>: free real-time DEX data, no API key needed ·
 <a href="https://docs.dexpaprika.com">streaming docs</a> ·
 <a href="https://github.com/coinpaprika/liquidity-radar">fork this radar</a></p>
 </body>`;

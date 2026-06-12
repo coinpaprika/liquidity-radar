@@ -130,7 +130,7 @@ const sleep = (ms: number, signal?: AbortSignal) =>
   });
 
 interface RoutedEvent {
-  /** The stream's request_id — the subscription's index for POST multiplex. */
+  /** The stream's request_id: the subscription's index for POST multiplex. */
   id?: string;
   event: ReserveEvent;
 }
@@ -138,7 +138,7 @@ interface RoutedEvent {
 /**
  * Shared connect/parse/retry loop. Transient failures retry with capped
  * exponential backoff; backoff only resets after the first parsed SSE message
- * (HTTP 200 alone proves nothing — proxies can 200-and-close). Permanent
+ * (HTTP 200 alone proves nothing; proxies can 200-and-close). Permanent
  * rejections (4xx other than 408/429, or in-stream `error` events) throw
  * StreamFatalError out of the generator.
  */
@@ -218,7 +218,7 @@ async function* streamLoop(
 
 /**
  * Subscribe to a single reserve stream over GET, yielding typed events.
- * Prefer subscribeReservesMulti for more than a couple of entries — the API
+ * Prefer subscribeReservesMulti for more than a couple of entries, because the API
  * caps concurrent streams at 10 per IP.
  */
 export async function* subscribeReserves(
@@ -245,7 +245,7 @@ export interface MultiplexedEvent {
  * Subscribe to up to 25 pools/tokens on ONE connection via POST multiplex.
  * Events are routed back to entries by request_id (the index in the POST
  * array), with a chain+address fallback. One invalid entry makes the server
- * reject the whole connection with an in-stream `error` event — that throws
+ * reject the whole connection with an in-stream `error` event, which throws
  * StreamFatalError carrying the server's message (e.g. "token not found:
  * ethereum/0xdead…"), so validate entries before subscribing.
  */

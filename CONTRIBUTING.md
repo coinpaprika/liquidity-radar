@@ -3,7 +3,7 @@
 Thanks for looking under the hood. The codebase is small on purpose:
 
 ```
-core/   the engine — zero dependencies, runs anywhere fetch exists
+core/   the engine: zero dependencies, runs anywhere fetch exists
 feed/   Cloudflare Worker for the live X feed
 cli/    thin wrapper around core
 ```
@@ -22,7 +22,7 @@ The live smoke test hits the real [DexPaprika API](https://docs.dexpaprika.com)
 
 ## What we're glad to merge
 
-- New alert sinks — keep them out of `core`, and append `DATA_CREDIT` from
+- New alert sinks: keep them out of `core`, and append `DATA_CREDIT` from
   `core/src/format.ts` by default (overridable), same as the webhook sink does
 - Detection improvements with a test showing the case they catch
 - Chain/DEX-specific quirk fixes, with a captured event in the test

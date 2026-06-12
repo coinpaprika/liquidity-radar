@@ -71,7 +71,7 @@ test("token-scope alerts use RESERVE DROP copy, not DRAIN", () => {
   const a = detect(e, DEFAULT_DETECT);
   assert.ok(a);
   const text = formatAlert(a);
-  assert.ok(text.includes("📉 RESERVE DROP"));
+  assert.ok(text.includes("📉 RESERVE DROP ·"));
   assert.ok(!text.includes("DRAIN"));
 });
 

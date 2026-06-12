@@ -15,10 +15,10 @@ crons = ["*/5 * * * *"] # bootstraps the DO after deploy, keeps it alive
 
 # Alerts go wherever you point WEBHOOK_URL (Discord webhooks are detected and
 # get Discord's shape; anything else receives {text, alert} JSON). Without it,
-# nothing leaves the worker — catches just show on the status page.
+# nothing leaves the worker; catches just show on the status page.
 #   wrangler secret put WEBHOOK_URL
 #
-# Default watchlist is bundled from ./watchlist.json at deploy time — edit
+# Default watchlist is bundled from ./watchlist.json at deploy time. Edit
 # that one file, run `npx wrangler deploy`, done. To override without a
 # redeploy, set a WATCHLIST var/secret with the same JSON shape (~5KB cap).
 #

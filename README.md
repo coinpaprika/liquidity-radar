@@ -26,7 +26,7 @@ out of this pool."
 
 ## Run it in your terminal
 
-Needs Node 18+. Three commands, no config — it ships with a curated watchlist
+Needs Node 18+. Three commands, no config. It ships with a curated watchlist
 of 58 pools across 6 chains:
 
 ```bash
@@ -36,17 +36,17 @@ npm run radar
 ```
 
 ```
-LiquidityRadar — live
-  data: DexPaprika reserve stream (free, no key) — dexpaprika.com
+LiquidityRadar (live)
+  data: DexPaprika reserve stream (free, no key): dexpaprika.com
   alerting on moves ≥ $10.0K and ≥ 20.0% of reserve
   …
 2026-06-10T23:27:00.000Z
-🚨 DRAIN — WETH/INPAY (Uniswap V4) on base
+🚨 DRAIN · WETH/INPAY (Uniswap V4) on base
 -$67.0K (-97.3%) · reserve now $1.9K
 pool 0x8b47…cedf · block 47172360
 ```
 
-Alerts at the default thresholds are rare by design — a 20% single-block move
+Alerts at the default thresholds are rare by design. A 20% single-block move
 is an event, not a Tuesday. To watch it work, lower the bar (alerts usually
 start within a minute or two):
 
@@ -54,20 +54,20 @@ start within a minute or two):
 npm run radar -- --verbose --min 1000 --pct 0.005   # every tick, and watch them turn into alerts
 ```
 
-At demo thresholds the same pool can re-alert every block it oscillates — the
+At demo thresholds the same pool can re-alert every block it oscillates; the
 CLI deliberately has no cooldown (the deployable feed below has one).
 
 ## Deploy your own 24/7 radar
 
 The `feed/` Worker watches around the clock, keeps a public status page of
-everything it catches, and (optionally) sends alerts to any webhook —
+everything it catches, and (optionally) sends alerts to any webhook:
 Discord, Slack, your own service. You need a free
 [Cloudflare account](https://dash.cloudflare.com/sign-up); the radar fits the
 free plan. Two ways in:
 
-**One-click:** hit the button — Cloudflare copies this repo into your GitHub
+**One-click:** hit the button and Cloudflare copies this repo into your GitHub
 account and deploys it. Then edit `watchlist.json` in that new repo (your
-pools, your thresholds — that one file is the whole configuration) and push;
+pools, your thresholds; that one file is the whole configuration) and push;
 Workers Builds redeploys automatically.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/coinpaprika/liquidity-radar)
@@ -89,7 +89,7 @@ every catch, timestamped, surviving restarts.
 
 **Send alerts anywhere.** Out of the box the radar is watch-only: catches
 accumulate on your status page and nothing leaves the worker. Point
-`WEBHOOK_URL` at any webhook to change that — Discord works in under a
+`WEBHOOK_URL` at any webhook to change that. Discord works in under a
 minute (Server Settings → Integrations → Webhooks → copy URL):
 
 ```bash
@@ -98,7 +98,7 @@ npx wrangler deploy
 ```
 
 Discord URLs get Discord's message shape automatically; anything else
-receives `{text, alert}` JSON — Telegram bridges, Slack, your trading bot,
+receives `{text, alert}` JSON for Telegram bridges, Slack, your trading bot,
 whatever you build. A send gate keeps any channel sane: dedup per pool+block,
 30-min per-pool cooldown, hourly cap, and automatic pauses on rate limits.
 
@@ -118,23 +118,23 @@ One file, `watchlist.json`. Forking is editing it.
 ```
 
 - `pool_reserves` follows one pool. A swap moves one side up and the other
-  down, netting near zero — so swaps never false-trigger. A real LP pull
+  down, netting near zero, so swaps never false-trigger. A real LP pull
   negates both legs at once. **Use pool mode for rug detection.**
 - `token_reserves` follows a token across every pool it trades in. It flags
-  any large one-sided move — including big swaps — so its alerts say
+  any large one-sided move (including big swaps), so its alerts say
   "RESERVE DROP", not "DRAIN".
 - `minUsd` / `pctThreshold` scale together: on a $50M blue-chip pool the
   default 20% bar means an eight-figure event; on a $100k memecoin pool a
   $20k pull trips it.
 - The whole list rides multiplexed connections (25 subscriptions each), on
-  every chain DexPaprika indexes — Ethereum, Solana, Base, BSC, Arbitrum,
+  every chain DexPaprika indexes: Ethereum, Solana, Base, BSC, Arbitrum,
   Sui, and 29 more.
 
 ## Who this is for
 
-- **DeFi traders** — get drain alerts before the timeline does.
-- **Security researchers** — monitor a set of tokens for exit patterns.
-- **Developers** — `core/` is a tiny, dependency-free SSE engine to build on.
+- **DeFi traders**: get drain alerts before the timeline does.
+- **Security researchers**: monitor a set of tokens for exit patterns.
+- **Developers**: `core/` is a tiny, dependency-free SSE engine to build on.
   See [ARCHITECTURE.md](ARCHITECTURE.md) for how it all fits together, or
   open a ready dev container:
 
@@ -143,7 +143,7 @@ One file, `watchlist.json`. Forking is editing it.
 ## What this costs to run
 
 - **CLI:** nothing. The [DexPaprika API](https://dexpaprika.com) is free,
-  keyless, no signup — generous limits (25 subscriptions per connection,
+  keyless, no signup, generous limits (25 subscriptions per connection,
   10 streams per IP).
 - **The 24/7 feed:** fits Cloudflare's free plan with thin headroom; the
   $5/month Workers Paid plan is the comfortable choice. Watchlist size
@@ -153,9 +153,9 @@ One file, `watchlist.json`. Forking is editing it.
 
 Every number this radar shows comes from the free DexPaprika data layer:
 
-- [dexpaprika.com](https://dexpaprika.com) — real-time DEX data, 35 chains
-- [Streaming docs](https://docs.dexpaprika.com) — the Reserve Stream API
-- [agents.dexpaprika.com](https://agents.dexpaprika.com) — agent-native onboarding
+- [dexpaprika.com](https://dexpaprika.com): real-time DEX data, 35 chains
+- [Streaming docs](https://docs.dexpaprika.com): the Reserve Stream API
+- [agents.dexpaprika.com](https://agents.dexpaprika.com): agent-native onboarding
 
 ## License
 

@@ -47,7 +47,7 @@ export interface RadarHandlers {
   onEvent?: EventHandler;
   /**
    * A subscription chunk stopped permanently: the server rejected an entry
-   * (bad chain/address/method). Not retried — fix the watchlist. Other chunks
+   * (bad chain/address/method). Not retried; fix the watchlist. Other chunks
    * keep running.
    */
   onFatal?: (error: StreamFatalError, entries: WatchEntry[]) => void;

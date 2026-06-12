@@ -49,7 +49,7 @@ function parseArgs(argv: string[]): Args {
 }
 
 function printHelp(): void {
-  console.log(`liquidity-radar — watch DEX reserves for drains and big adds
+  console.log(`liquidity-radar: watch DEX reserves for drains and big adds
 
 Usage:
   liquidity-radar [watchlist.json] [options]
@@ -60,7 +60,7 @@ Options:
   --verbose, -v  print every reserve tick, not just alerts
   --help, -h     show this help
 
-Data: DexPaprika reserve stream (free, no key, no KYC) — dexpaprika.com
+Data: DexPaprika reserve stream (free, no key, no KYC): dexpaprika.com
 The shipped watchlist.json alerts at \$10k and 20% of reserve; big pools
 rarely move that much in a block. To watch it work right away:
   liquidity-radar watchlist.json --verbose --min 1000 --pct 0.005`);
@@ -90,8 +90,8 @@ async function main(): Promise<void> {
   const minUsd = config.minUsd ?? 25_000;
   const pctThreshold = config.pctThreshold ?? 0.1;
 
-  console.log("LiquidityRadar — live");
-  console.log("  data: DexPaprika reserve stream (free, no key) — dexpaprika.com");
+  console.log("LiquidityRadar (live)");
+  console.log("  data: DexPaprika reserve stream (free, no key): dexpaprika.com");
   console.log(
     `  alerting on moves ≥ ${usd(minUsd)} and ≥ ${(pctThreshold * 100).toFixed(1)}% of reserve`,
   );
@@ -107,7 +107,7 @@ async function main(): Promise<void> {
   const tick = (event: ReserveEvent, entry: WatchEntry) => {
     events++;
     if (events === 1 && !args.verbose) {
-      console.log("✓ connected — streaming live reserve events (quiet until a threshold hits)\n");
+      console.log("✓ connected, streaming live reserve events (quiet until a threshold hits)\n");
     }
     if (!args.verbose) return;
     const name = entry.label ?? shortAddr(entry.address);
@@ -160,7 +160,7 @@ async function main(): Promise<void> {
   await radar.start();
   if (heartbeat) clearInterval(heartbeat);
   if (!stopping) {
-    fail("all subscriptions have ended — see errors above");
+    fail("all subscriptions have ended, see errors above");
   }
 }
 

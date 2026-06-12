@@ -2,7 +2,7 @@ import type { Alert } from "./types.js";
 
 /**
  * Data-source credit for outbound alert sinks (X, Telegram, Discord, …).
- * Sinks should append this by default and may allow opting out — see the
+ * Sinks should append this by default and may allow opting out; see the
  * feed's POST_SUFFIX for the pattern.
  */
 export const DATA_CREDIT = "data: dexpaprika.com";
@@ -29,7 +29,7 @@ export function pct(p: number): string {
  * One-line, emoji-tagged summary used by both the CLI and the X feed.
  *
  * Pool-scope drains net both legs, so they really do mean liquidity left the
- * pool — those get the DRAIN siren. Token-scope events are one-sided by
+ * pool, so those get the DRAIN siren. Token-scope events are one-sided by
  * nature (a whale buy drops reserves too), so they get the softer
  * RESERVE DROP/ADD copy to avoid branding a big swap as a rug.
  */
@@ -40,7 +40,7 @@ export function formatAlert(a: Alert): string {
   const name = a.label ?? shortAddr(a.subject);
   const where = a.scope === "pool" ? "pool" : "token";
   return (
-    `${icon} ${verb} — ${name} on ${a.chain}\n` +
+    `${icon} ${verb} · ${name} on ${a.chain}\n` +
     `${usd(a.deltaUsd)} (${pct(a.pct)}) · reserve now ${usd(a.reserveUsd)}\n` +
     `${where} ${shortAddr(a.subject)} · block ${a.block}`
   );

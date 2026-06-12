@@ -135,7 +135,7 @@ test("formatAlert produces the canonical drain line", () => {
   );
   assert.ok(a);
   const text = formatAlert(a);
-  assert.ok(text.includes("🚨 DRAIN — SOMETOKEN/WETH on ethereum"));
+  assert.ok(text.includes("🚨 DRAIN · SOMETOKEN/WETH on ethereum"));
   assert.ok(text.includes("-$1.24M"));
   assert.ok(text.includes("block 25286203"));
 });

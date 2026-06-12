@@ -1,6 +1,6 @@
 // Generic outbound sink: every gated alert POSTs to WEBHOOK_URL.
 //
-// Works with anything that accepts a webhook — Discord URLs are detected and
+// Works with anything that accepts a webhook. Discord URLs are detected and
 // get Discord's {content} shape, everything else gets {text, alert} JSON.
 // No WEBHOOK_URL configured = fail-closed dry run: catches stay on the
 // status page and nothing leaves the worker.
