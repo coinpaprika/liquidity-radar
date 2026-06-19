@@ -1,10 +1,15 @@
 // LiquidityRadar live feed: Cloudflare Worker + Durable Object.
 //
-// Worker: edge-cached landing page (/) + live JSON (/api/live) + /health; a
-// cron bootstraps the DO and keeps it alive. RadarDO: holds the multiplexed
-// SSE subscription, rebuilds its watchlist hourly from the most active pools,
-// confirms drains persist before posting, gates them, and tracks the
-// "fast risers drain" hypothesis.
+// Two tiers:
+//  1. REST scanner (cheap, thousands of pools): every SCAN_INTERVAL the DO pages
+//     through the small + recently-created pools on each chain via
+//     /networks/{chain}/pools/filter, stores liquidity_usd snapshots in memory,
+//     and ranks the fastest-rising. liquidity_usd is a ~20-30s aggregate (probed),
+//     so the scan runs on a 60s cadence and growth is measured over minutes.
+//  2. Reserve stream (precious, ~74 pools): the top fastest-rising pools are put
+//     on the multiplexed reserve stream for block-level drain confirmation. So a
+//     pool the scanner flags as rising is the same pool the stream catches when it
+//     drains: flag the rise, confirm the cliff, one story.
 //
 // Rug feed: posts DRAINS only, and only after a drain has held for
 // DRAIN_CONFIRM_SECONDS (a drop that refills is suppressed). POST_ADDS=1 to
@@ -27,31 +32,46 @@ import bundledWatchlist from "../../watchlist.json";
 
 export interface Env extends SinkEnv {
   RADAR: DurableObjectNamespace;
-  WATCHLIST?: string; // JSON RadarConfig override; if unset, the dynamic top-pools list is used
+  WATCHLIST?: string; // JSON RadarConfig override; if unset, the scanner picks the stream targets
   POST_COOLDOWN_MINUTES?: string;
   POSTS_PER_HOUR?: string;
   POST_SUFFIX?: string;
   DRAIN_CONFIRM_SECONDS?: string; // a drain must persist this long before sending (default 90)
   POST_ADDS?: string; // "1" to also post liquidity adds (default off)
-  POOLS_PER_CHAIN?: string; // dynamic watchlist size per chain (default 40; see the per-IP stream cap)
+  POOLS_PER_CHAIN?: string; // cold-start volume watchlist size per chain (default 37)
+  SCAN_PAGES?: string; // pools/filter pages scanned per chain each cycle (default 6 = 600 pools/chain)
+  SCAN_INTERVAL_SECONDS?: string; // liquidity scan cadence (default 60; liquidity_usd refreshes ~20-30s)
 }
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const ALARM_INTERVAL_MS = 30_000;
 const PERSIST_FRACTION = 0.5; // a confirmed drain is still down to <= this fraction of pre-drain
-const SERIES_CAP = 120; // rolling reserve points kept per pool for the live chart
-const REFRESH_MS = 60 * 60 * 1000; // rebuild the watchlist hourly
-// Pools per chain in the dynamic list. The free keyless stream caps concurrent
-// connections per IP at 3 (probed live 2026-06-19: exactly 3 of N POSTs return
-// 200, the rest 429 "stream limit exceeded"), and the radar packs 25 subs per
-// connection. So 3 connections = ~75 pools is the free ceiling. 37/chain (74
-// total) sits exactly at 3 connections with a 1-pool margin; 76+ tips into a
-// 4th connection and 429s. Raise POOLS_PER_CHAIN only with an enterprise key
-// (higher stream limit) or when the load is sharded across IPs.
+const SERIES_CAP = 120; // rolling reserve points kept per streamed pool for the live chart
+const REFRESH_MS = 60 * 60 * 1000; // rebuild the cold-start volume watchlist hourly
+// Pools per chain in the cold-start volume watchlist (used until the scanner has
+// growth data). The free keyless stream allows 3 connections per IP (probed
+// live), 25 subs each, so ~75 pools is the free ceiling; 37/chain (74 total)
+// packs into exactly 3 connections. Raise only with an enterprise key.
 const DEFAULT_PER_CHAIN = 37;
+const STREAM_TARGETS = 74; // pools handed to the reserve stream (free-tier ceiling)
 const DYNAMIC_CHAINS = ["solana", "ethereum"];
-const RUG_MIN_RISE = 0.5; // liquidity up >= 50% over the window
-const RUG_MAX_TVL = 750_000; // small pool; blue-chips don't rug
+
+// --- liquidity scanner -------------------------------------------------------
+const DEFAULT_SCAN_PAGES = 6; // 100 pools/page; newest-created first
+const DEFAULT_SCAN_INTERVAL_S = 60;
+const PAGE_SPACING_MS = 450; // pace pages: REST is a burst limiter (~30 req/20s), Retry-After 20
+const MAX_429_RETRIES = 2; // consecutive 429s on a page before giving up (don't freeze the alarm)
+const MAX_BACKOFF_S = 30; // cap an over-large Retry-After
+const SCAN_LIQ_MIN = 10_000; // skip dust
+const SCAN_LIQ_MAX = 2_000_000; // skip blue-chips: they don't rug
+const SCAN_TXNS_MIN = 50; // must be active
+const SCAN_AGE_DAYS = 7; // recently created = rug-prone
+const LIQ_PTS_CAP = 8; // ~8 min of history per pool at 60s cadence
+const LIQ_POOLS_CAP = 3000; // tracked pools (memory bound)
+const RISE_THRESHOLD = 0.03; // >=3% growth over the window counts as "rising" (sub-1% is noise)
+const RUG_MAX_TVL = 750_000; // high-risk subset: small pool + steep rise
+const STREAM_REFRESH_MS = 5 * 60 * 1000; // re-point the stream at fresh risers at most this often
+const STREAM_CHURN_FRACTION = 0.25; // ...and only if the target set changed by more than this
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
 const STABLES = new Set([
   "USDC", "USDT", "USDG", "PYUSD", "USDS", "DAI", "USDE", "USDM", "FDUSD",
@@ -62,6 +82,7 @@ function envInt(v: string | undefined, fallback: number): number {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const FALLBACK_WATCHLIST = bundledWatchlist as unknown as RadarConfig;
 
@@ -91,6 +112,20 @@ interface Gate {
 }
 // hypothesis buckets, keyed by subject (pool id), naturally deduped
 type HypMark = { label: string; chain: string; t: number; pct: number };
+// one scanned pool's liquidity history (in memory; rebuilds after eviction)
+interface LiqTrack {
+  label: string;
+  chain: string;
+  pts: { t: number; liq: number }[];
+}
+// a ranked riser surfaced to the page / chosen for the stream
+interface Riser {
+  id: string;
+  label: string;
+  chain: string;
+  growthPct: number;
+  liqUsd: number;
+}
 
 const RECENT_CAP = 150;
 const emptyGate = (): Gate => ({ posted: {}, lastBySubject: {}, recentPosts: [], pausedUntilMs: 0 });
@@ -144,7 +179,10 @@ export class RadarDO {
   private radar?: Radar;
   private running = false;
   private lastEventMs = 0;
-  private lastRefreshMs = 0;
+  private lastRefreshMs = 0; // last cold-start volume rebuild
+  private lastScanMs = 0; // last liquidity scan
+  private lastStreamPickMs = 0; // last time the stream targets were re-evaluated
+  private scanning = false;
   private configSource = "(not loaded yet)";
   private thresholds = "";
   private issues: string[] = [];
@@ -152,6 +190,7 @@ export class RadarDO {
   private pending = new Map<string, Pending>();
   private series = new Map<string, { t: number; r: number }[]>();
   private meta = new Map<string, { label: string; chain: string }>();
+  private liq = new Map<string, LiqTrack>(); // scanned pools' liquidity history
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -183,12 +222,10 @@ export class RadarDO {
 
   async alarm(): Promise<void> {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
-    if (Date.now() - this.lastRefreshMs > REFRESH_MS) {
-      const changed = await this.refreshWatchlist();
-      if (changed && this.running) {
-        this.radar?.stop(); // resubscribe with the fresh list on the next ensureRunning
-        this.running = false;
-      }
+    const scanMs = envInt(this.env.SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_S) * 1000;
+    if (Date.now() - this.lastScanMs > scanMs) {
+      await this.scanLiquidity();
+      await this.maybeRepointStream();
     }
     await this.ensureRunning();
     await this.updateHypothesis();
@@ -202,48 +239,63 @@ export class RadarDO {
     if (this.running) return;
     this.running = true;
 
-    const config = await this.activeConfig();
-    const confirmS = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90);
-    this.thresholds =
-      `alerts on drains ≥$${(config.minUsd ?? 25000).toLocaleString("en-US")} and ≥${((config.pctThreshold ?? 0.1) * 100).toFixed(0)}% of reserve, confirmed over ${confirmS}s`;
+    let radar: Radar;
+    try {
+      const config = await this.activeConfig();
+      const confirmS = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90);
+      this.thresholds =
+        `alerts on drains ≥$${(config.minUsd ?? 25000).toLocaleString("en-US")} and ≥${((config.pctThreshold ?? 0.1) * 100).toFixed(0)}% of reserve, confirmed over ${confirmS}s`;
 
-    const epoch = `${this.thresholds} | ${config.watch.length}p`;
-    const prevEpoch = (await this.state.storage.get<string>("epoch")) ?? "";
-    if (prevEpoch !== epoch) {
-      await this.state.storage.put("epoch", epoch);
-      await this.state.storage.delete("recent");
-      await this.state.storage.delete("stats");
+      const epoch = `${this.thresholds} | ${config.watch.length}p`;
+      const prevEpoch = (await this.state.storage.get<string>("epoch")) ?? "";
+      if (prevEpoch !== epoch) {
+        await this.state.storage.put("epoch", epoch);
+        await this.state.storage.delete("recent");
+        await this.state.storage.delete("stats");
+      }
+
+      radar = createRadar(config, {
+        onAlert: (alert) => this.handleAlert(alert),
+        onEvent: (event, entry) => {
+          this.lastEventMs = Date.now();
+          const { subject, reserve } = subjectReserve(event);
+          if (!subject || !Number.isFinite(reserve)) return;
+          this.lastReserve.set(subject, reserve);
+          const arr = this.series.get(subject) ?? [];
+          arr.push({ t: Math.floor(Date.now() / 1000), r: reserve });
+          if (arr.length > SERIES_CAP) arr.shift();
+          this.series.set(subject, arr);
+          this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain });
+        },
+        onFatal: (err, entries) =>
+          this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
+        onWarning: (msg) => this.note(msg),
+      });
+    } catch (err) {
+      // setup failed (e.g. activeConfig fetch/storage threw); reset so the next
+      // alarm retries instead of wedging running=true with no radar.
+      this.running = false;
+      this.note(`ensureRunning setup failed: ${String(err)}`);
+      return;
     }
 
-    const radar = createRadar(config, {
-      onAlert: (alert) => this.handleAlert(alert),
-      onEvent: (event, entry) => {
-        this.lastEventMs = Date.now();
-        const { subject, reserve } = subjectReserve(event);
-        if (!subject || !Number.isFinite(reserve)) return;
-        this.lastReserve.set(subject, reserve);
-        const arr = this.series.get(subject) ?? [];
-        arr.push({ t: Math.floor(Date.now() / 1000), r: reserve });
-        if (arr.length > SERIES_CAP) arr.shift();
-        this.series.set(subject, arr);
-        this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain });
-      },
-      onFatal: (err, entries) =>
-        this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
-      onWarning: (msg) => this.note(msg),
-    });
     this.radar = radar;
+    const thisRadar = radar;
     radar
       .start()
       .catch((err) => this.note(`radar crashed: ${String(err)}`))
       .finally(() => {
-        radar.stop();
-        if (this.radar === radar) this.radar = undefined;
-        this.running = false;
+        // only the CURRENT radar's teardown may reset state; a re-point swaps in
+        // a new radar, and the old one's late teardown must not clear its flags.
+        if (this.radar === thisRadar) {
+          this.radar = undefined;
+          this.running = false;
+        }
       });
   }
 
-  // Watchlist priority: WATCHLIST var override -> dynamic top-pools -> bundled.
+  // Stream targets, in priority order:
+  //   WATCHLIST var override -> scanner's top risers -> cold-start volume list -> bundled.
   private async activeConfig(): Promise<RadarConfig> {
     if (this.env.WATCHLIST) {
       try {
@@ -256,25 +308,163 @@ export class RadarDO {
         this.note(`WATCHLIST invalid, falling back: ${String(err)}`);
       }
     }
+    const stream = await this.state.storage.get<WatchEntry[]>("streamWatchlist");
+    if (stream && stream.length) {
+      this.configSource = `scanner: top ${stream.length} fastest-rising pools`;
+      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: stream };
+    }
+    // cold start: stream the most active pools until the scanner has growth data
     let dyn = await this.state.storage.get<WatchEntry[]>("dynamicWatchlist");
     if (!dyn || !dyn.length) {
       await this.refreshWatchlist();
       dyn = await this.state.storage.get<WatchEntry[]>("dynamicWatchlist");
     }
     if (dyn && dyn.length) {
-      this.configSource = `dynamic top pools (${dyn.length}, refreshed hourly)`;
+      this.configSource = `cold start: ${dyn.length} most-active pools (scanner warming up)`;
       return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: dyn };
     }
     this.configSource = `bundled watchlist.json (${FALLBACK_WATCHLIST.watch.length} pools)`;
     return FALLBACK_WATCHLIST;
   }
 
-  // Rebuild from the most active pools per chain, dropping stablecoin pairs and
-  // orderbook DEXs (whose reserves blip). Returns true if the set changed.
+  private isStablePair(syms: string[]): boolean {
+    return syms.length === 2 && syms.every((s) => STABLES.has(String(s).toUpperCase()));
+  }
+  private poolLabel(p: any): { syms: string[]; dex: string; label: string } {
+    const dex = String(p.dex_name ?? p.dex_id ?? "?");
+    const syms = (p.tokens ?? []).map((t: any) => t.symbol ?? "?").slice(0, 2);
+    return { syms, dex, label: `${syms.join("/")} (${dex})` };
+  }
+
+  // --- tier 1: liquidity scanner --------------------------------------------
+  // Page through each chain's small + recently-created pools and record their
+  // liquidity_usd. Paced sequentially (REST is a burst limiter); Retry-After is
+  // honored with a backoff. Builds the in-memory history growth ranking reads.
+  private async scanLiquidity(): Promise<void> {
+    if (this.scanning) return;
+    this.scanning = true;
+    const now = Date.now();
+    const pages = envInt(this.env.SCAN_PAGES, DEFAULT_SCAN_PAGES);
+    const createdAfter = Math.floor((now - SCAN_AGE_DAYS * 86400_000) / 1000);
+    const seenIds = new Set<string>(); // dedupe a pool that lands on two pages this scan
+    let seen = 0;
+    try {
+      for (const chain of DYNAMIC_CHAINS) {
+        let retries = 0;
+        for (let page = 1; page <= pages; page++) {
+          const url =
+            `https://api.dexpaprika.com/networks/${chain}/pools/filter` +
+            `?liquidity_usd_min=${SCAN_LIQ_MIN}&liquidity_usd_max=${SCAN_LIQ_MAX}` +
+            `&txns_24h_min=${SCAN_TXNS_MIN}&created_after=${createdAfter}` +
+            `&sort_by=created_at&sort_dir=desc&limit=100&page=${page}`;
+          let results: any[] = [];
+          try {
+            const r = await fetch(url, { headers: { accept: "application/json" } });
+            if (r.status === 429) {
+              if (retries >= MAX_429_RETRIES) {
+                this.note(`scan ${chain} still 429 after ${retries} retries; skipping rest of chain`);
+                break;
+              }
+              retries++;
+              const wait = Math.min(envInt(r.headers.get("retry-after") ?? undefined, 20), MAX_BACKOFF_S);
+              this.note(`scan ${chain} p${page} rate-limited, backing off ${wait}s`);
+              await sleep(wait * 1000);
+              page--; // retry this page
+              continue;
+            }
+            retries = 0; // any non-429 response clears the streak
+            if (!r.ok) break; // page past the end / transient: stop this chain
+            results = ((await r.json()) as { results?: any[] })?.results ?? [];
+          } catch (e) {
+            this.note(`scan ${chain} p${page}: ${String(e)}`);
+            break;
+          }
+          if (!results.length) break;
+          for (const p of results) {
+            const id = String(p.id ?? "");
+            const liq = Number(p.liquidity_usd);
+            if (!id || !Number.isFinite(liq) || liq <= 0) continue;
+            if (seenIds.has(id)) continue; // already sampled this scan: one point per pool per scan
+            seenIds.add(id);
+            const { syms, dex, label } = this.poolLabel(p);
+            if (/manifest/i.test(dex)) continue;
+            if (this.isStablePair(syms)) continue;
+            const track = this.liq.get(id) ?? { label, chain, pts: [] };
+            track.label = label;
+            track.pts.push({ t: now, liq });
+            if (track.pts.length > LIQ_PTS_CAP) track.pts.shift();
+            this.liq.set(id, track);
+            seen++;
+          }
+          await sleep(PAGE_SPACING_MS);
+        }
+      }
+    } finally {
+      this.capLiq();
+      this.lastScanMs = Date.now();
+      this.scanning = false;
+    }
+    // persist the derived lists so /api/live survives a DO eviction
+    const risers = this.rankRisers();
+    await this.state.storage.put("scan_rising", risers.slice(0, 20));
+    await this.state.storage.put(
+      "scan_rugwatch",
+      risers.filter((r) => r.liqUsd <= RUG_MAX_TVL).slice(0, 12),
+    );
+    if (seen) this.note(`scan ok: ${seen} pool samples, ${this.liq.size} tracked`);
+  }
+
+  private capLiq(): void {
+    if (this.liq.size <= LIQ_POOLS_CAP) return;
+    const byAge = [...this.liq.entries()].sort(
+      (a, b) => (a[1].pts.at(-1)?.t ?? 0) - (b[1].pts.at(-1)?.t ?? 0),
+    );
+    for (const [id] of byAge.slice(0, this.liq.size - LIQ_POOLS_CAP)) this.liq.delete(id);
+  }
+
+  // Growth over the stored window (first -> last point), thresholded and ranked.
+  private rankRisers(): Riser[] {
+    const out: Riser[] = [];
+    for (const [id, t] of this.liq) {
+      if (t.pts.length < 2) continue;
+      const first = t.pts[0].liq;
+      const last = t.pts[t.pts.length - 1].liq;
+      if (first <= 0) continue;
+      const growthPct = (last - first) / first;
+      if (growthPct >= RISE_THRESHOLD) out.push({ id, label: t.label, chain: t.chain, growthPct, liqUsd: last });
+    }
+    return out.sort((a, b) => b.growthPct - a.growthPct);
+  }
+
+  // Re-point the reserve stream at the freshest risers, rate-limited and only on
+  // a material change, so we don't thrash the subscription (which would drop
+  // in-flight drain confirmation).
+  private async maybeRepointStream(): Promise<void> {
+    if (this.env.WATCHLIST) return; // explicit override wins
+    const now = Date.now();
+    if (now - this.lastStreamPickMs < STREAM_REFRESH_MS) return;
+    const risers = this.rankRisers();
+    if (risers.length < 20) return; // not enough growth signal yet; stay on cold-start list
+    const targets: WatchEntry[] = risers
+      .slice(0, STREAM_TARGETS)
+      .map((r) => ({ method: "pool_reserves", chain: r.chain, address: r.id, label: r.label }));
+    const prev = (await this.state.storage.get<WatchEntry[]>("streamWatchlist")) ?? [];
+    const prevSet = new Set(prev.map((w) => w.address));
+    const overlap = targets.filter((t) => prevSet.has(t.address)).length;
+    const churn = prev.length ? 1 - overlap / Math.max(targets.length, prev.length) : 1;
+    this.lastStreamPickMs = now;
+    if (churn < STREAM_CHURN_FRACTION && prev.length) return; // close enough, leave it
+    await this.state.storage.put("streamWatchlist", targets);
+    if (this.running) {
+      this.radar?.stop(); // resubscribe with the fresh risers on the next ensureRunning
+      this.running = false;
+    }
+    this.note(`stream re-pointed at top ${targets.length} risers (churn ${(churn * 100).toFixed(0)}%)`);
+  }
+
+  // Cold-start watchlist: most active pools by volume, until the scanner ranks risers.
   private async refreshWatchlist(): Promise<boolean> {
     const perChain = envInt(this.env.POOLS_PER_CHAIN, DEFAULT_PER_CHAIN);
-    const isStablePair = (syms: string[]) =>
-      syms.length === 2 && syms.every((s) => STABLES.has(String(s).toUpperCase()));
     const out: WatchEntry[] = [];
     for (const chain of DYNAMIC_CHAINS) {
       let kept = 0;
@@ -294,11 +484,10 @@ export class RadarDO {
         }
         for (const p of pools) {
           if (kept >= perChain) break;
-          const dex = String(p.dex_name ?? p.dex_id ?? "?");
+          const { syms, dex, label } = this.poolLabel(p);
           if (/manifest/i.test(dex)) continue;
-          const syms = (p.tokens ?? []).map((t: any) => t.symbol ?? "?").slice(0, 2);
-          if (isStablePair(syms)) continue;
-          out.push({ method: "pool_reserves", chain, address: p.id, label: `${syms.join("/")} (${dex})` });
+          if (this.isStablePair(syms)) continue;
+          out.push({ method: "pool_reserves", chain, address: p.id, label });
           kept++;
         }
       }
@@ -398,32 +587,15 @@ export class RadarDO {
     await this.state.storage.put("stats", s);
   }
 
-  // Pools currently matching the quick-scam profile (steep rise + small TVL).
-  private currentRugWatch(): { subject: string; label: string; chain: string; changePct: number; reserveUsd: number }[] {
-    const out: { subject: string; label: string; chain: string; changePct: number; reserveUsd: number }[] = [];
-    for (const [subject, pts] of this.series) {
-      if (pts.length < 2) continue;
-      const first = pts[0].r;
-      const last = pts[pts.length - 1].r;
-      if (first <= 0) continue;
-      const changePct = (last - first) / first;
-      if (changePct >= RUG_MIN_RISE && last <= RUG_MAX_TVL) {
-        const m = this.meta.get(subject) ?? { label: subject, chain: "?" };
-        out.push({ subject, label: m.label, chain: m.chain, changePct, reserveUsd: last });
-      }
-    }
-    return out.sort((a, b) => b.changePct - a.changePct);
-  }
-
-  // Record pools that enter the rug-watch profile (the hypothesis: do these drain?).
+  // Record pools the scanner flags as steep risers (the hypothesis: do these drain?).
   private async updateHypothesis(): Promise<void> {
-    const flagged = this.currentRugWatch();
+    const flagged = this.rankRisers().filter((r) => r.liqUsd <= RUG_MAX_TVL);
     if (!flagged.length) return;
     const rw = (await this.state.storage.get<Record<string, HypMark>>("hyp_rw")) ?? {};
     let changed = false;
     for (const f of flagged) {
-      if (!rw[f.subject]) {
-        rw[f.subject] = { label: f.label, chain: f.chain, t: Date.now(), pct: f.changePct };
+      if (!rw[f.id]) {
+        rw[f.id] = { label: f.label, chain: f.chain, t: Date.now(), pct: f.growthPct };
         changed = true;
       }
     }
@@ -446,21 +618,37 @@ export class RadarDO {
 
   private async buildLive(): Promise<unknown> {
     const now = Date.now();
-    const movers: { label: string; chain: string; changePct: number; reserveUsd: number; series: { t: number; r: number }[] }[] = [];
-    for (const [subject, pts] of this.series) {
-      if (pts.length < 2) continue;
-      const first = pts[0].r;
-      const last = pts[pts.length - 1].r;
-      if (first <= 0) continue;
-      const m = this.meta.get(subject) ?? { label: subject, chain: "?" };
-      movers.push({ label: m.label, chain: m.chain, changePct: (last - first) / first, reserveUsd: last, series: pts });
+    // rising / rug-watch come from the scanner (thousands of pools)
+    let risers = this.rankRisers();
+    if (!risers.length) risers = (await this.state.storage.get<Riser[]>("scan_rising")) ?? [];
+    const rising = risers.slice(0, 12).map((r) => ({ label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
+    let rugList = risers.filter((r) => r.liqUsd <= RUG_MAX_TVL);
+    if (!rugList.length) rugList = (await this.state.storage.get<Riser[]>("scan_rugwatch")) ?? [];
+    const rugWatch = rugList.slice(0, 8).map((r) => ({ label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
+
+    // hero chart: the fastest-rising pool we're actually streaming (real-time series)
+    let hero: { label: string; chain: string; changePct: number; series: { t: number; r: number }[] } | null = null;
+    for (const r of risers) {
+      const pts = this.series.get(r.id);
+      if (pts && pts.length >= 2) {
+        hero = { label: r.label, chain: r.chain, changePct: r.growthPct, series: pts.map((p) => ({ t: p.t, r: Math.round(p.r) })) };
+        break;
+      }
     }
-    movers.sort((a, b) => b.changePct - a.changePct);
-    const risers = movers.filter((m) => m.changePct > 0.0005);
-    const hero = risers[0] ?? movers[0] ?? null;
-    const rugWatch = this.currentRugWatch()
-      .slice(0, 8)
-      .map((m) => ({ label: m.label, chain: m.chain, changePct: m.changePct, reserveUsd: m.reserveUsd }));
+    if (!hero) {
+      // fall back to the liveliest streamed series so the chart is never blank
+      let best: { subject: string; pts: { t: number; r: number }[]; chg: number } | null = null;
+      for (const [subject, pts] of this.series) {
+        if (pts.length < 2 || pts[0].r <= 0) continue;
+        const chg = (pts[pts.length - 1].r - pts[0].r) / pts[0].r;
+        if (!best || chg > best.chg) best = { subject, pts, chg };
+      }
+      if (best) {
+        const m = this.meta.get(best.subject) ?? { label: best.subject, chain: "?" };
+        hero = { label: m.label, chain: m.chain, changePct: best.chg, series: best.pts.map((p) => ({ t: p.t, r: Math.round(p.r) })) };
+      }
+    }
+
     const recent = (await this.state.storage.get<RecentEntry[]>("recent")) ?? [];
     const draining = recent
       .filter((r) => r.alert.kind === "drain" && r.reason !== "suppressed: refilled")
@@ -469,9 +657,10 @@ export class RadarDO {
     const stats = (await this.state.storage.get<Stats>("stats")) ?? emptyStats(now);
     return {
       now,
-      watching: this.meta.size,
-      hero: hero ? { label: hero.label, chain: hero.chain, changePct: hero.changePct, series: hero.series.map((p) => ({ t: p.t, r: Math.round(p.r) })) } : null,
-      rising: risers.slice(0, 8).map((m) => ({ label: m.label, chain: m.chain, changePct: m.changePct, reserveUsd: m.reserveUsd })),
+      watching: this.meta.size, // pools on the live reserve stream that have emitted
+      scanning: this.liq.size, // pools the REST scanner is tracking for liquidity growth
+      hero,
+      rising,
       rugWatch,
       draining,
       hypothesis: await this.buildHypothesis(),
@@ -490,6 +679,7 @@ export class RadarDO {
     const live = isLive(this.env);
     const mode = live ? "live, sending drains to webhook" : "watch-only (no WEBHOOK_URL)";
     const lastEvent = this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
+    const lastScan = this.lastScanMs > 0 ? `${Math.round((now - this.lastScanMs) / 1000)}s ago` : "not yet";
     const lastPost = gate.lastPostAtMs ? new Date(gate.lastPostAtMs).toISOString() : "never";
     const sentLabel = live ? "sent" : "would have sent";
     const totals = stats
@@ -515,7 +705,8 @@ export class RadarDO {
     return `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>LiquidityRadar status</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px">
 <h1>LiquidityRadar status</h1>
-<p>mode: <strong>${escapeHtml(mode)}</strong> · watchlist: ${escapeHtml(this.configSource)}<br>
+<p>mode: <strong>${escapeHtml(mode)}</strong> · stream: ${escapeHtml(this.configSource)}<br>
+scanner: ${this.liq.size} pools tracked · last scan ${escapeHtml(lastScan)}<br>
 ${escapeHtml(this.thresholds)}<br>last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
 ${paused}${postError}

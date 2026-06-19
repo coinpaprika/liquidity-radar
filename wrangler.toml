@@ -33,11 +33,19 @@ POSTS_PER_HOUR = "6"
 DRAIN_CONFIRM_SECONDS = "90"   # a drain must hold this long before it posts; a drop that refills is suppressed
 POST_ADDS = "0"                # rug feed: drains only. set "1" to also post liquidity adds
 
-# Dynamic watchlist size per chain (solana + ethereum). The watchlist rebuilds
-# hourly from each chain's most active pools. The free keyless reserve stream
-# allows 3 concurrent connections per IP (probed live), 25 subscriptions each,
-# so ~75 pools is the free ceiling. 37/chain (74 total) packs into exactly 3
-# connections and streams cleanly; 38+/chain tips into a 4th connection and the
-# extra gets 429'd. Bump this (toward 250/chain for ~1000 pools) only with an
-# enterprise key that raises the per-IP stream limit, or shard across IPs.
+# Cold-start stream watchlist size per chain. Used only until the liquidity
+# scanner has growth data, then the stream re-points at the fastest-rising pools.
+# The free keyless reserve stream allows 3 connections per IP (probed live), 25
+# subs each, so ~74 pools is the free ceiling; 37/chain packs into exactly 3
+# connections. Bump only with an enterprise key that lifts the stream limit.
 POOLS_PER_CHAIN = "37"
+
+# Liquidity scanner (tier 1): every SCAN_INTERVAL_SECONDS the DO pages through
+# each chain's small + recently-created pools via /pools/filter and records
+# liquidity_usd, then ranks the fastest-rising and hands the top ~74 to the
+# reserve stream. liquidity_usd is a ~20-30s aggregate (probed), so polling
+# faster than ~30s just re-reads the same numbers; 60s is the sweet spot.
+# SCAN_PAGES x 100 = pools scanned per chain per cycle. REST is a burst limiter
+# (~30 req / 20s window), so pages are paced; keep SCAN_PAGES modest.
+SCAN_PAGES = "6"
+SCAN_INTERVAL_SECONDS = "60"

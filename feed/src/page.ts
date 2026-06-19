@@ -64,9 +64,10 @@ export const LANDING_HTML = `<!doctype html>
   </section>
 
   <div class="grid">
-    <div class="card"><h3>🟢 Rising now</h3><div id="rising"><div class="empty">…</div></div></div>
+    <div class="card"><h3>🟢 Fastest-rising liquidity</h3><div id="rising"><div class="empty">…</div></div>
+      <div class="disc">Pools whose liquidity is climbing fastest right now, scanned across thousands of pairs.</div></div>
     <div class="card"><h3>🚩 Rug watch</h3><div id="rugwatch"><div class="empty">…</div></div>
-      <div class="disc">Small alt pools building liquidity unusually fast: the classic pre-rug profile. High-risk, not a guarantee, not financial advice.</div></div>
+      <div class="disc">Small, recently-created pools building liquidity unusually fast: the classic pre-rug profile. High-risk, not a guarantee, not financial advice.</div></div>
     <div class="card"><h3>🚨 Just drained</h3><div id="draining"><div class="empty">…</div></div></div>
   </div>
 
@@ -107,7 +108,7 @@ function list(el,items,render){el.innerHTML=items.length?items.map(render).join(
 async function tick(){
   try{
     const d=await (await fetch('/api/live',{cache:'no-store'})).json();
-    $('watching').textContent=d.watching+' pools live';
+    $('watching').textContent=(d.scanning||0).toLocaleString()+' pools scanned · '+d.watching+' streamed live';
     if(d.hero){
       $('hero-name').textContent=d.hero.label+' ';
       $('hero-sub').innerHTML=d.hero.chain+' · liquidity '+usd(d.hero.series.at(-1).r)+' · <span class="chg '+(d.hero.changePct<0?'down':'up')+'">'+pct(d.hero.changePct)+'</span> over window';
@@ -124,7 +125,7 @@ async function tick(){
         '<span><b>'+(h.flagged?(h.rate*100).toFixed(0):'0')+'%</b> hit rate so far</span>'+
         '<span><b>'+h.totalDrains+'</b> drains seen overall</span>';
     }
-    $('stats').innerHTML='<span><b>'+d.stats.drains+'</b> confirmed drains</span><span><b>'+d.stats.suppressed+'</b> suppressed as transient</span><span><b>'+d.watching+'</b> pools watched</span>';
+    $('stats').innerHTML='<span><b>'+d.stats.drains+'</b> confirmed drains</span><span><b>'+d.stats.suppressed+'</b> suppressed as transient</span><span><b>'+(d.scanning||0).toLocaleString()+'</b> pools scanned for liquidity growth</span>';
   }catch(e){$('watching').textContent='reconnecting…'}
 }
 tick();setInterval(tick,1500);
