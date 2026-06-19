@@ -30,3 +30,5 @@ crons = ["*/5 * * * *"] # bootstraps the DO after deploy, keeps it alive
 [vars]
 POST_COOLDOWN_MINUTES = "30"
 POSTS_PER_HOUR = "6"
+DRAIN_CONFIRM_SECONDS = "90"   # a drain must hold this long before it posts; a drop that refills is suppressed
+POST_ADDS = "0"                # rug feed: drains only. set "1" to also post liquidity adds

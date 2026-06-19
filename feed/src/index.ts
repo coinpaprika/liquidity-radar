@@ -2,9 +2,15 @@
 //
 // Worker: edge-cached public status page + /health; a cron trigger bootstraps
 // the Durable Object after deploy and keeps it alive with no visitors.
-// RadarDO: holds the multiplexed SSE subscription, gates alerts (dedup,
-// per-subject cooldown, hourly cap, 429 pauses), sends them to your webhook,
-// renders the status page.
+// RadarDO: holds the multiplexed SSE subscription, confirms drains persist,
+// gates them (dedup, per-subject cooldown, hourly cap, 429 pauses), sends to
+// your webhook, renders the status page.
+//
+// This is a rug feed: it posts DRAINS only, and only after a drain has held
+// for DRAIN_CONFIRM_SECONDS. A drop that refills within the window (a data
+// blip, an orderbook DEX momentarily reading near-zero, a JIT cycle) is
+// suppressed, so the feed never cries wolf on a healthy pool. Set POST_ADDS=1
+// to also post liquidity adds.
 //
 // Sending is fail-closed: without WEBHOOK_URL nothing leaves the worker;
 // catches just accumulate on the status page.
@@ -17,6 +23,7 @@ import {
   type Alert,
   type Radar,
   type RadarConfig,
+  type ReserveEvent,
 } from "../../core/src/index.js";
 import { isLive, postAlert, type SinkEnv } from "./webhook.js";
 import bundledWatchlist from "../../watchlist.json";
@@ -27,55 +34,67 @@ export interface Env extends SinkEnv {
   POST_COOLDOWN_MINUTES?: string; // per-subject cooldown (default 30)
   POSTS_PER_HOUR?: string; // global cap (default 6)
   POST_SUFFIX?: string; // appended to every alert; "" disables the default credit
+  DRAIN_CONFIRM_SECONDS?: string; // a drain must persist this long before sending (default 90)
+  POST_ADDS?: string; // "1" to also post liquidity adds (default off: this is a rug feed)
 }
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const ALARM_INTERVAL_MS = 30_000;
+// after the confirm window, a drain counts as real if the reserve is still
+// below this fraction of its pre-drain level (else it refilled = transient)
+const PERSIST_FRACTION = 0.5;
 
 function envInt(v: string | undefined, fallback: number): number {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-// curated default: the repo-root watchlist.json, bundled at deploy time (too
-// large for an env var). The WATCHLIST var still overrides it without a redeploy.
 const FALLBACK_WATCHLIST = bundledWatchlist as unknown as RadarConfig;
 
 interface RecentEntry {
   alert: Alert;
   posted: boolean;
-  reason?: string; // why a catch was not posted (duplicate, cooldown, cap, pause)
+  reason?: string; // why a catch was not sent (suppressed, duplicate, cooldown, cap, pause)
 }
 
 interface Stats {
-  catches: number;
-  passedGate: number;
+  drains: number; // drains that resolved (sent + suppressed + gate-skipped)
+  sent: number; // drains that passed the gate and were sent
+  suppressed: number; // drains that refilled within the window (transient)
   sinceMs: number;
 }
 
-const RECENT_CAP = 150; // ~60KB of a 128KB DO storage value; a busy night fits
+interface Pending {
+  alert: Alert;
+  prevReserveUsd: number;
+  atMs: number;
+}
+
+const RECENT_CAP = 150;
 
 interface Gate {
-  posted: Record<string, number>; // dedup key -> ms timestamp
-  lastBySubject: Record<string, number>; // subject -> ms of last post
-  recentPosts: number[]; // ms timestamps inside the sliding hour
+  posted: Record<string, number>;
+  lastBySubject: Record<string, number>;
+  recentPosts: number[];
   pausedUntilMs: number;
   lastPostAtMs?: number;
   lastPostError?: string;
 }
 
-const emptyGate = (): Gate => ({
-  posted: {},
-  lastBySubject: {},
-  recentPosts: [],
-  pausedUntilMs: 0,
-});
+const emptyGate = (): Gate => ({ posted: {}, lastBySubject: {}, recentPosts: [], pausedUntilMs: 0 });
+const emptyStats = (now: number): Stats => ({ drains: 0, sent: 0, suppressed: 0, sinceMs: now });
 
 function escapeHtml(v: unknown): string {
   return String(v).replace(
     /[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!,
   );
+}
+
+function subjectReserve(e: ReserveEvent): { subject: string; reserve: number } {
+  return e.type === "pool_reserves"
+    ? { subject: e.pool_id, reserve: e.total_reserve_usd }
+    : { subject: e.token_id, reserve: e.reserve_usd };
 }
 
 export default {
@@ -85,8 +104,6 @@ export default {
     if (url.pathname === "/health") return new Response("ok", { status: 200 });
     if (url.pathname !== "/") return new Response("not found", { status: 404 });
 
-    // serve the status page from the edge cache so launch-day traffic never
-    // piles onto the single DO holding the SSE connections
     const cache = caches.default;
     const cached = await cache.match(req);
     if (cached) return cached;
@@ -96,7 +113,6 @@ export default {
   },
 
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    // bootstrap after deploy + keep-alive belt over the DO's own alarm chain
     ctx.waitUntil(
       env.RADAR.get(env.RADAR.idFromName("singleton")).fetch("https://radar.internal/__start"),
     );
@@ -112,6 +128,8 @@ export class RadarDO {
   private configSource = "(not loaded yet)";
   private thresholds = "";
   private issues: string[] = [];
+  private lastReserve = new Map<string, number>(); // subject -> current reserve USD
+  private pending = new Map<string, Pending>(); // subject -> drain awaiting confirmation
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -130,16 +148,14 @@ export class RadarDO {
     const gate = (await this.state.storage.get<Gate>("gate")) ?? emptyGate();
     const stats = (await this.state.storage.get<Stats>("stats")) ?? null;
     return new Response(this.renderStatus(recent, gate, stats), {
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "public, max-age=30",
-      },
+      headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=30" },
     });
   }
 
   async alarm(): Promise<void> {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     await this.ensureRunning();
+    await this.resolvePending();
   }
 
   private async ensureRunning(): Promise<void> {
@@ -150,11 +166,13 @@ export class RadarDO {
     this.running = true;
 
     const config = this.loadConfig();
-    this.thresholds = `alerts at ≥$${(config.minUsd ?? 25000).toLocaleString("en-US")} and ≥${((config.pctThreshold ?? 0.1) * 100).toFixed(0)}% of reserve`;
+    const confirmS = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90);
+    this.thresholds =
+      `alerts on drains ≥$${(config.minUsd ?? 25000).toLocaleString("en-US")} and ≥${((config.pctThreshold ?? 0.1) * 100).toFixed(0)}% of reserve, ` +
+      `confirmed over ${confirmS}s`;
 
-    // thresholds define the experiment: when they change, the catch list and
-    // counters restart so old-epoch noise doesn't pollute the readout (the
-    // posting gate survives; its cooldowns protect the X quota)
+    // epoch resets the readout when detection behavior changes (thresholds or
+    // the confirm window), so the page never mixes old-logic and new-logic data
     const epoch = (await this.state.storage.get<string>("epoch")) ?? "";
     if (epoch !== this.thresholds) {
       await this.state.storage.put("epoch", this.thresholds);
@@ -164,8 +182,10 @@ export class RadarDO {
 
     const radar = createRadar(config, {
       onAlert: (alert) => this.handleAlert(alert),
-      onEvent: () => {
+      onEvent: (event) => {
         this.lastEventMs = Date.now();
+        const { subject, reserve } = subjectReserve(event);
+        if (subject && Number.isFinite(reserve)) this.lastReserve.set(subject, reserve);
       },
       onFatal: (err, entries) =>
         this.note(
@@ -178,8 +198,6 @@ export class RadarDO {
       .start()
       .catch((err) => this.note(`radar crashed: ${String(err)}`))
       .finally(() => {
-        // abort any surviving sibling subscriptions so the next restart can
-        // never run two radars (and double-post) at once
         radar.stop();
         if (this.radar === radar) this.radar = undefined;
         this.running = false;
@@ -204,11 +222,47 @@ export class RadarDO {
     }
   }
 
+  // Route alerts: drains queue for confirmation; adds are ignored unless POST_ADDS.
   private async handleAlert(alert: Alert): Promise<void> {
     this.lastEventMs = Date.now();
+    this.lastReserve.set(alert.subject, alert.reserveUsd);
+    if (alert.kind === "add") {
+      if (this.env.POST_ADDS === "1") await this.commit(alert);
+      return;
+    }
+    // first drain per subject wins until it resolves; later blocks of the same
+    // unfolding drain don't pile up
+    if (!this.pending.has(alert.subject)) {
+      this.pending.set(alert.subject, {
+        alert,
+        prevReserveUsd: alert.prevReserveUsd,
+        atMs: Date.now(),
+      });
+    }
+  }
+
+  // After the confirm window, send the drain only if it actually held.
+  private async resolvePending(): Promise<void> {
+    const now = Date.now();
+    const confirmMs = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90) * 1000;
+    for (const [subject, p] of [...this.pending]) {
+      if (now - p.atMs < confirmMs) continue;
+      this.pending.delete(subject);
+      const cur = this.lastReserve.get(subject);
+      const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd * PERSIST_FRACTION;
+      if (stillDrained) {
+        await this.commit(p.alert);
+      } else {
+        await this.record(p.alert, false, "suppressed: refilled");
+        await this.bumpStats({ drains: 1, suppressed: 1 });
+      }
+    }
+  }
+
+  // Gate + send a confirmed alert, then record it.
+  private async commit(alert: Alert): Promise<void> {
     const now = Date.now();
     const gate = (await this.state.storage.get<Gate>("gate")) ?? emptyGate();
-
     for (const [k, ts] of Object.entries(gate.posted)) {
       if (now - ts > DEDUP_TTL_MS) delete gate.posted[k];
     }
@@ -216,22 +270,18 @@ export class RadarDO {
 
     const cooldownMs = envInt(this.env.POST_COOLDOWN_MINUTES, 30) * 60 * 1000;
     const capPerHour = envInt(this.env.POSTS_PER_HOUR, 6);
-
     const key = `${alert.subject}:${alert.block}:${alert.kind}`;
     let reason: string | undefined;
     if (gate.posted[key]) reason = "duplicate";
-    else if (now < gate.pausedUntilMs) reason = "rate-limited by X";
-    else if (now - (gate.lastBySubject[alert.subject] ?? 0) < cooldownMs) {
-      reason = "subject cooldown";
-    } else if (gate.recentPosts.length >= capPerHour) reason = "hourly cap";
+    else if (now < gate.pausedUntilMs) reason = "rate-limited by webhook";
+    else if (now - (gate.lastBySubject[alert.subject] ?? 0) < cooldownMs) reason = "subject cooldown";
+    else if (gate.recentPosts.length >= capPerHour) reason = "hourly cap";
 
     if (!reason) {
-      // claim the slot before the network call so a slow post can't double-send
       gate.posted[key] = now;
       gate.lastBySubject[alert.subject] = now;
       gate.recentPosts.push(now);
       await this.state.storage.put("gate", gate);
-
       const suffix =
         this.env.POST_SUFFIX !== undefined ? this.env.POST_SUFFIX : `\n\n${DATA_CREDIT}`;
       const result = await postAlert(formatAlert(alert) + suffix, alert, this.env);
@@ -245,19 +295,22 @@ export class RadarDO {
       }
       await this.state.storage.put("gate", gate);
     }
+    await this.record(alert, !reason, reason);
+    await this.bumpStats({ drains: 1, sent: reason ? 0 : 1 });
+  }
 
+  private async record(alert: Alert, posted: boolean, reason?: string): Promise<void> {
     const recent = (await this.state.storage.get<RecentEntry[]>("recent")) ?? [];
-    recent.unshift({ alert, posted: !reason, reason });
+    recent.unshift({ alert, posted, reason });
     await this.state.storage.put("recent", recent.slice(0, RECENT_CAP));
+  }
 
-    const stats = (await this.state.storage.get<Stats>("stats")) ?? {
-      catches: 0,
-      passedGate: 0,
-      sinceMs: now,
-    };
-    stats.catches++;
-    if (!reason) stats.passedGate++;
-    await this.state.storage.put("stats", stats);
+  private async bumpStats(d: { drains?: number; sent?: number; suppressed?: number }): Promise<void> {
+    const s = (await this.state.storage.get<Stats>("stats")) ?? emptyStats(Date.now());
+    s.drains += d.drains ?? 0;
+    s.sent += d.sent ?? 0;
+    s.suppressed += d.suppressed ?? 0;
+    await this.state.storage.put("stats", s);
   }
 
   private note(msg: string): void {
@@ -270,17 +323,15 @@ export class RadarDO {
     const now = Date.now();
     const live = isLive(this.env);
     const mode = live
-      ? "live, sending alerts to webhook"
+      ? "live, sending drains to webhook"
       : "watch-only (no WEBHOOK_URL, catches stay on this page)";
     const lastEvent =
       this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
-    const lastPost = gate.lastPostAtMs
-      ? new Date(gate.lastPostAtMs).toISOString()
-      : "never";
-    const passedLabel = live ? "sent" : "would have sent";
+    const lastPost = gate.lastPostAtMs ? new Date(gate.lastPostAtMs).toISOString() : "never";
+    const sentLabel = live ? "sent" : "would have sent";
     const totals = stats
-      ? `${stats.catches} catches (${stats.passedGate} ${passedLabel}) since ${new Date(stats.sinceMs).toISOString().slice(0, 16).replace("T", " ")} UTC`
-      : "no catches yet";
+      ? `${stats.drains} confirmed drains · ${stats.sent} ${sentLabel} · ${stats.suppressed} suppressed as transient, since ${new Date(stats.sinceMs).toISOString().slice(0, 16).replace("T", " ")} UTC`
+      : "no drains yet";
     const paused =
       now < gate.pausedUntilMs
         ? `<p><strong>⏸ sending paused until ${escapeHtml(new Date(gate.pausedUntilMs).toISOString())} (webhook rate limit)</strong></p>`
@@ -302,21 +353,21 @@ export class RadarDO {
         const when = new Date(a.timestamp * 1000).toISOString().slice(5, 16).replace("T", " ");
         const ageH = (now / 1000 - a.timestamp) / 3600;
         const age = ageH < 1 ? `${Math.max(0, Math.round(ageH * 60))}m ago` : `${ageH.toFixed(1)}h ago`;
-        const tag = r.posted ? passedLabel : `skipped: ${r.reason}`;
+        const tag = r.posted ? sentLabel : `skipped: ${r.reason}`;
         return `<li><code>${escapeHtml(when)} UTC · ${escapeHtml(age)}</code><br>${icon} ${escapeHtml(a.label ?? a.subject)} on ${escapeHtml(a.chain)} · ${escapeHtml(amount)} (${escapeHtml(pctText)}) · block ${escapeHtml(a.block)} · <em>${escapeHtml(tag)}</em></li>`;
       })
       .join("\n");
     return `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>LiquidityRadar</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px">
 <h1>LiquidityRadar (live)</h1>
-<p>Real-time DEX liquidity drains &amp; adds on the free DexPaprika reserve stream.</p>
+<p>Real-time DEX liquidity-drain alerts on the free DexPaprika reserve stream. Drains are confirmed (a drop that refills is suppressed) before they post.</p>
 <p>mode: <strong>${escapeHtml(mode)}</strong> · watchlist: ${escapeHtml(this.configSource)}<br>
 ${escapeHtml(this.thresholds)}<br>
 last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
 ${paused}${postError}
-<h2>Recent catches</h2>
-<ul style="list-style:none;padding:0">${rows ? rows.replace(/<li>/g, '<li style="margin:10px 0">') : "<li>nothing caught yet (drains are rare by design)</li>"}</ul>
+<h2>Recent drains</h2>
+<ul style="list-style:none;padding:0">${rows ? rows.replace(/<li>/g, '<li style="margin:10px 0">') : "<li>nothing caught yet (confirmed drains are rare by design)</li>"}</ul>
 ${issues}
 <hr style="margin-top:32px;border:none;border-top:1px solid #ddd">
 <p style="color:#666">Powered by <a href="https://dexpaprika.com">DexPaprika</a>: free real-time DEX data, no API key needed ·
