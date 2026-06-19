@@ -1,19 +1,14 @@
 // LiquidityRadar live feed: Cloudflare Worker + Durable Object.
 //
-// Worker: edge-cached public status page + /health; a cron trigger bootstraps
-// the Durable Object after deploy and keeps it alive with no visitors.
-// RadarDO: holds the multiplexed SSE subscription, confirms drains persist,
-// gates them (dedup, per-subject cooldown, hourly cap, 429 pauses), sends to
-// your webhook, renders the status page.
+// Worker: edge-cached landing page (/) + live JSON (/api/live) + /health; a
+// cron bootstraps the DO and keeps it alive. RadarDO: holds the multiplexed
+// SSE subscription, rebuilds its watchlist hourly from the most active pools,
+// confirms drains persist before posting, gates them, and tracks the
+// "fast risers drain" hypothesis.
 //
-// This is a rug feed: it posts DRAINS only, and only after a drain has held
-// for DRAIN_CONFIRM_SECONDS. A drop that refills within the window (a data
-// blip, an orderbook DEX momentarily reading near-zero, a JIT cycle) is
-// suppressed, so the feed never cries wolf on a healthy pool. Set POST_ADDS=1
-// to also post liquidity adds.
-//
-// Sending is fail-closed: without WEBHOOK_URL nothing leaves the worker;
-// catches just accumulate on the status page.
+// Rug feed: posts DRAINS only, and only after a drain has held for
+// DRAIN_CONFIRM_SECONDS (a drop that refills is suppressed). POST_ADDS=1 to
+// also post adds. Sending is fail-closed: without WEBHOOK_URL nothing leaves.
 
 import {
   DATA_CREDIT,
@@ -24,6 +19,7 @@ import {
   type Radar,
   type RadarConfig,
   type ReserveEvent,
+  type WatchEntry,
 } from "../../core/src/index.js";
 import { isLive, postAlert, type SinkEnv } from "./webhook.js";
 import { LANDING_HTML } from "./page.js";
@@ -31,19 +27,36 @@ import bundledWatchlist from "../../watchlist.json";
 
 export interface Env extends SinkEnv {
   RADAR: DurableObjectNamespace;
-  WATCHLIST?: string; // JSON RadarConfig (same shape as watchlist.json)
-  POST_COOLDOWN_MINUTES?: string; // per-subject cooldown (default 30)
-  POSTS_PER_HOUR?: string; // global cap (default 6)
-  POST_SUFFIX?: string; // appended to every alert; "" disables the default credit
+  WATCHLIST?: string; // JSON RadarConfig override; if unset, the dynamic top-pools list is used
+  POST_COOLDOWN_MINUTES?: string;
+  POSTS_PER_HOUR?: string;
+  POST_SUFFIX?: string;
   DRAIN_CONFIRM_SECONDS?: string; // a drain must persist this long before sending (default 90)
-  POST_ADDS?: string; // "1" to also post liquidity adds (default off: this is a rug feed)
+  POST_ADDS?: string; // "1" to also post liquidity adds (default off)
+  POOLS_PER_CHAIN?: string; // dynamic watchlist size per chain (default 40; see the per-IP stream cap)
 }
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const ALARM_INTERVAL_MS = 30_000;
-// after the confirm window, a drain counts as real if the reserve is still
-// below this fraction of its pre-drain level (else it refilled = transient)
-const PERSIST_FRACTION = 0.5;
+const PERSIST_FRACTION = 0.5; // a confirmed drain is still down to <= this fraction of pre-drain
+const SERIES_CAP = 120; // rolling reserve points kept per pool for the live chart
+const REFRESH_MS = 60 * 60 * 1000; // rebuild the watchlist hourly
+// Pools per chain in the dynamic list. The free keyless stream caps concurrent
+// connections per IP at 3 (probed live 2026-06-19: exactly 3 of N POSTs return
+// 200, the rest 429 "stream limit exceeded"), and the radar packs 25 subs per
+// connection. So 3 connections = ~75 pools is the free ceiling. 37/chain (74
+// total) sits exactly at 3 connections with a 1-pool margin; 76+ tips into a
+// 4th connection and 429s. Raise POOLS_PER_CHAIN only with an enterprise key
+// (higher stream limit) or when the load is sharded across IPs.
+const DEFAULT_PER_CHAIN = 37;
+const DYNAMIC_CHAINS = ["solana", "ethereum"];
+const RUG_MIN_RISE = 0.5; // liquidity up >= 50% over the window
+const RUG_MAX_TVL = 750_000; // small pool; blue-chips don't rug
+const HYP_CAP = 800; // tracked subjects per hypothesis bucket
+const STABLES = new Set([
+  "USDC", "USDT", "USDG", "PYUSD", "USDS", "DAI", "USDE", "USDM", "FDUSD",
+  "TUSD", "USD₮0", "USDT0", "USD₮", "BUSD", "FRAX", "GUSD", "LUSD", "USDD", "USDC.E",
+]);
 
 function envInt(v: string | undefined, fallback: number): number {
   const n = Number(v);
@@ -55,25 +68,19 @@ const FALLBACK_WATCHLIST = bundledWatchlist as unknown as RadarConfig;
 interface RecentEntry {
   alert: Alert;
   posted: boolean;
-  reason?: string; // why a catch was not sent (suppressed, duplicate, cooldown, cap, pause)
+  reason?: string;
 }
-
 interface Stats {
-  drains: number; // drains that resolved (sent + suppressed + gate-skipped)
-  sent: number; // drains that passed the gate and were sent
-  suppressed: number; // drains that refilled within the window (transient)
+  drains: number;
+  sent: number;
+  suppressed: number;
   sinceMs: number;
 }
-
 interface Pending {
   alert: Alert;
   prevReserveUsd: number;
   atMs: number;
 }
-
-const RECENT_CAP = 150;
-const SERIES_CAP = 120; // rolling reserve points kept per pool for the live chart
-
 interface Gate {
   posted: Record<string, number>;
   lastBySubject: Record<string, number>;
@@ -82,7 +89,10 @@ interface Gate {
   lastPostAtMs?: number;
   lastPostError?: string;
 }
+// hypothesis buckets, keyed by subject (pool id), naturally deduped
+type HypMark = { label: string; chain: string; t: number; pct: number };
 
+const RECENT_CAP = 150;
 const emptyGate = (): Gate => ({ posted: {}, lastBySubject: {}, recentPosts: [], pausedUntilMs: 0 });
 const emptyStats = (now: number): Stats => ({ drains: 0, sent: 0, suppressed: 0, sinceMs: now });
 
@@ -92,11 +102,17 @@ function escapeHtml(v: unknown): string {
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!,
   );
 }
-
 function subjectReserve(e: ReserveEvent): { subject: string; reserve: number } {
   return e.type === "pool_reserves"
     ? { subject: e.pool_id, reserve: e.total_reserve_usd }
     : { subject: e.token_id, reserve: e.reserve_usd };
+}
+function capObject<T>(obj: Record<string, T & { t: number }>, cap: number): Record<string, T & { t: number }> {
+  const keys = Object.keys(obj);
+  if (keys.length <= cap) return obj;
+  keys.sort((a, b) => obj[a].t - obj[b].t);
+  for (const k of keys.slice(0, keys.length - cap)) delete obj[k];
+  return obj;
 }
 
 export default {
@@ -107,8 +123,6 @@ export default {
     if (!["/", "/api/live", "/status"].includes(url.pathname)) {
       return new Response("not found", { status: 404 });
     }
-
-    // edge-cache so many viewers polling /api/live hit cache, not the single DO
     const cache = caches.default;
     const cached = await cache.match(req);
     if (cached) return cached;
@@ -117,7 +131,7 @@ export default {
     return res;
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(_e: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
       env.RADAR.get(env.RADAR.idFromName("singleton")).fetch("https://radar.internal/__start"),
     );
@@ -130,12 +144,13 @@ export class RadarDO {
   private radar?: Radar;
   private running = false;
   private lastEventMs = 0;
+  private lastRefreshMs = 0;
   private configSource = "(not loaded yet)";
   private thresholds = "";
   private issues: string[] = [];
-  private lastReserve = new Map<string, number>(); // subject -> current reserve USD
-  private pending = new Map<string, Pending>(); // subject -> drain awaiting confirmation
-  private series = new Map<string, { t: number; r: number }[]>(); // rolling reserves for the live chart
+  private lastReserve = new Map<string, number>();
+  private pending = new Map<string, Pending>();
+  private series = new Map<string, { t: number; r: number }[]>();
   private meta = new Map<string, { label: string; chain: string }>();
 
   constructor(state: DurableObjectState, env: Env) {
@@ -147,7 +162,6 @@ export class RadarDO {
     await this.ensureRunning();
     const url = new URL(req.url);
     if (url.pathname === "/__start") return new Response("started", { status: 200 });
-
     if (url.pathname === "/api/live") {
       return new Response(JSON.stringify(await this.buildLive()), {
         headers: { "content-type": "application/json", "cache-control": "public, max-age=1" },
@@ -158,11 +172,7 @@ export class RadarDO {
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=10" },
       });
     }
-
-    // /status — operator debug view
-    if (this.issues.length === 0) {
-      this.issues = (await this.state.storage.get<string[]>("issues")) ?? [];
-    }
+    if (this.issues.length === 0) this.issues = (await this.state.storage.get<string[]>("issues")) ?? [];
     const recent = (await this.state.storage.get<RecentEntry[]>("recent")) ?? [];
     const gate = (await this.state.storage.get<Gate>("gate")) ?? emptyGate();
     const stats = (await this.state.storage.get<Stats>("stats")) ?? null;
@@ -173,7 +183,15 @@ export class RadarDO {
 
   async alarm(): Promise<void> {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    if (Date.now() - this.lastRefreshMs > REFRESH_MS) {
+      const changed = await this.refreshWatchlist();
+      if (changed && this.running) {
+        this.radar?.stop(); // resubscribe with the fresh list on the next ensureRunning
+        this.running = false;
+      }
+    }
     await this.ensureRunning();
+    await this.updateHypothesis();
     await this.resolvePending();
   }
 
@@ -184,17 +202,15 @@ export class RadarDO {
     if (this.running) return;
     this.running = true;
 
-    const config = this.loadConfig();
+    const config = await this.activeConfig();
     const confirmS = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90);
     this.thresholds =
-      `alerts on drains ≥$${(config.minUsd ?? 25000).toLocaleString("en-US")} and ≥${((config.pctThreshold ?? 0.1) * 100).toFixed(0)}% of reserve, ` +
-      `confirmed over ${confirmS}s`;
+      `alerts on drains ≥$${(config.minUsd ?? 25000).toLocaleString("en-US")} and ≥${((config.pctThreshold ?? 0.1) * 100).toFixed(0)}% of reserve, confirmed over ${confirmS}s`;
 
-    // epoch resets the readout when detection behavior changes (thresholds or
-    // the confirm window), so the page never mixes old-logic and new-logic data
-    const epoch = (await this.state.storage.get<string>("epoch")) ?? "";
-    if (epoch !== this.thresholds) {
-      await this.state.storage.put("epoch", this.thresholds);
+    const epoch = `${this.thresholds} | ${config.watch.length}p`;
+    const prevEpoch = (await this.state.storage.get<string>("epoch")) ?? "";
+    if (prevEpoch !== epoch) {
+      await this.state.storage.put("epoch", epoch);
       await this.state.storage.delete("recent");
       await this.state.storage.delete("stats");
     }
@@ -213,9 +229,7 @@ export class RadarDO {
         this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain });
       },
       onFatal: (err, entries) =>
-        this.note(
-          `subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`,
-        ),
+        this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
       onWarning: (msg) => this.note(msg),
     });
     this.radar = radar;
@@ -229,25 +243,77 @@ export class RadarDO {
       });
   }
 
-  private loadConfig(): RadarConfig {
-    if (!this.env.WATCHLIST) {
-      this.configSource = `bundled watchlist.json (${FALLBACK_WATCHLIST.watch.length} pools)`;
-      return FALLBACK_WATCHLIST;
+  // Watchlist priority: WATCHLIST var override -> dynamic top-pools -> bundled.
+  private async activeConfig(): Promise<RadarConfig> {
+    if (this.env.WATCHLIST) {
+      try {
+        const parsed = JSON.parse(this.env.WATCHLIST);
+        const errs = validateRadarConfig(parsed);
+        if (errs.length) throw new Error(errs.join("; "));
+        this.configSource = `WATCHLIST var (${parsed.watch.length} entries)`;
+        return parsed as RadarConfig;
+      } catch (err) {
+        this.note(`WATCHLIST invalid, falling back: ${String(err)}`);
+      }
     }
-    try {
-      const parsed = JSON.parse(this.env.WATCHLIST);
-      const errors = validateRadarConfig(parsed);
-      if (errors.length > 0) throw new Error(errors.join("; "));
-      this.configSource = `WATCHLIST var (${parsed.watch.length} entries)`;
-      return parsed as RadarConfig;
-    } catch (err) {
-      this.note(`WATCHLIST invalid, using bundled watchlist: ${String(err)}`);
-      this.configSource = "bundled watchlist.json (WATCHLIST var INVALID, fix it!)";
-      return FALLBACK_WATCHLIST;
+    let dyn = await this.state.storage.get<WatchEntry[]>("dynamicWatchlist");
+    if (!dyn || !dyn.length) {
+      await this.refreshWatchlist();
+      dyn = await this.state.storage.get<WatchEntry[]>("dynamicWatchlist");
     }
+    if (dyn && dyn.length) {
+      this.configSource = `dynamic top pools (${dyn.length}, refreshed hourly)`;
+      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: dyn };
+    }
+    this.configSource = `bundled watchlist.json (${FALLBACK_WATCHLIST.watch.length} pools)`;
+    return FALLBACK_WATCHLIST;
   }
 
-  // Route alerts: drains queue for confirmation; adds are ignored unless POST_ADDS.
+  // Rebuild from the most active pools per chain, dropping stablecoin pairs and
+  // orderbook DEXs (whose reserves blip). Returns true if the set changed.
+  private async refreshWatchlist(): Promise<boolean> {
+    const perChain = envInt(this.env.POOLS_PER_CHAIN, DEFAULT_PER_CHAIN);
+    const isStablePair = (syms: string[]) =>
+      syms.length === 2 && syms.every((s) => STABLES.has(String(s).toUpperCase()));
+    const out: WatchEntry[] = [];
+    for (const chain of DYNAMIC_CHAINS) {
+      let kept = 0;
+      for (const page of [0, 1]) {
+        if (kept >= perChain) break;
+        let pools: any[] = [];
+        try {
+          const r = await fetch(
+            `https://api.dexpaprika.com/networks/${chain}/pools?page=${page}&limit=100&order_by=volume_usd&sort=desc`,
+            { headers: { accept: "application/json" } },
+          );
+          if (!r.ok) continue;
+          pools = ((await r.json()) as { pools?: any[] })?.pools ?? [];
+        } catch (e) {
+          this.note(`watchlist refresh ${chain} p${page}: ${String(e)}`);
+          continue;
+        }
+        for (const p of pools) {
+          if (kept >= perChain) break;
+          const dex = String(p.dex_name ?? p.dex_id ?? "?");
+          if (/manifest/i.test(dex)) continue;
+          const syms = (p.tokens ?? []).map((t: any) => t.symbol ?? "?").slice(0, 2);
+          if (isStablePair(syms)) continue;
+          out.push({ method: "pool_reserves", chain, address: p.id, label: `${syms.join("/")} (${dex})` });
+          kept++;
+        }
+      }
+    }
+    if (out.length < 20) {
+      this.note(`watchlist refresh got only ${out.length} pools; keeping previous`);
+      return false;
+    }
+    const prev = (await this.state.storage.get<WatchEntry[]>("dynamicWatchlist")) ?? [];
+    const changed = prev.map((w) => w.address).join() !== out.map((w) => w.address).join();
+    await this.state.storage.put("dynamicWatchlist", out);
+    this.lastRefreshMs = Date.now();
+    return changed;
+  }
+
   private async handleAlert(alert: Alert): Promise<void> {
     this.lastEventMs = Date.now();
     this.lastReserve.set(alert.subject, alert.reserveUsd);
@@ -255,18 +321,11 @@ export class RadarDO {
       if (this.env.POST_ADDS === "1") await this.commit(alert);
       return;
     }
-    // first drain per subject wins until it resolves; later blocks of the same
-    // unfolding drain don't pile up
     if (!this.pending.has(alert.subject)) {
-      this.pending.set(alert.subject, {
-        alert,
-        prevReserveUsd: alert.prevReserveUsd,
-        atMs: Date.now(),
-      });
+      this.pending.set(alert.subject, { alert, prevReserveUsd: alert.prevReserveUsd, atMs: Date.now() });
     }
   }
 
-  // After the confirm window, send the drain only if it actually held.
   private async resolvePending(): Promise<void> {
     const now = Date.now();
     const confirmMs = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90) * 1000;
@@ -284,13 +343,10 @@ export class RadarDO {
     }
   }
 
-  // Gate + send a confirmed alert, then record it.
   private async commit(alert: Alert): Promise<void> {
     const now = Date.now();
     const gate = (await this.state.storage.get<Gate>("gate")) ?? emptyGate();
-    for (const [k, ts] of Object.entries(gate.posted)) {
-      if (now - ts > DEDUP_TTL_MS) delete gate.posted[k];
-    }
+    for (const [k, ts] of Object.entries(gate.posted)) if (now - ts > DEDUP_TTL_MS) delete gate.posted[k];
     gate.recentPosts = gate.recentPosts.filter((t) => now - t < 60 * 60 * 1000);
 
     const cooldownMs = envInt(this.env.POST_COOLDOWN_MINUTES, 30) * 60 * 1000;
@@ -307,8 +363,7 @@ export class RadarDO {
       gate.lastBySubject[alert.subject] = now;
       gate.recentPosts.push(now);
       await this.state.storage.put("gate", gate);
-      const suffix =
-        this.env.POST_SUFFIX !== undefined ? this.env.POST_SUFFIX : `\n\n${DATA_CREDIT}`;
+      const suffix = this.env.POST_SUFFIX !== undefined ? this.env.POST_SUFFIX : `\n\n${DATA_CREDIT}`;
       const result = await postAlert(formatAlert(alert) + suffix, alert, this.env);
       if (result.ok) {
         gate.lastPostAtMs = now;
@@ -322,6 +377,11 @@ export class RadarDO {
     }
     await this.record(alert, !reason, reason);
     await this.bumpStats({ drains: 1, sent: reason ? 0 : 1 });
+    if (alert.kind === "drain") {
+      const dr = (await this.state.storage.get<Record<string, HypMark>>("hyp_dr")) ?? {};
+      dr[alert.subject] = { label: alert.label ?? alert.subject, chain: alert.chain, t: now, pct: alert.pct };
+      await this.state.storage.put("hyp_dr", capObject(dr, HYP_CAP));
+    }
   }
 
   private async record(alert: Alert, posted: boolean, reason?: string): Promise<void> {
@@ -338,18 +398,55 @@ export class RadarDO {
     await this.state.storage.put("stats", s);
   }
 
-  // Live dashboard state: rank pools by liquidity growth over the rolling
-  // window, pick the hero (fastest riser) with its full series, and list recent
-  // confirmed drains. Computed on demand from in-memory series + stored recent.
+  // Pools currently matching the quick-scam profile (steep rise + small TVL).
+  private currentRugWatch(): { subject: string; label: string; chain: string; changePct: number; reserveUsd: number }[] {
+    const out: { subject: string; label: string; chain: string; changePct: number; reserveUsd: number }[] = [];
+    for (const [subject, pts] of this.series) {
+      if (pts.length < 2) continue;
+      const first = pts[0].r;
+      const last = pts[pts.length - 1].r;
+      if (first <= 0) continue;
+      const changePct = (last - first) / first;
+      if (changePct >= RUG_MIN_RISE && last <= RUG_MAX_TVL) {
+        const m = this.meta.get(subject) ?? { label: subject, chain: "?" };
+        out.push({ subject, label: m.label, chain: m.chain, changePct, reserveUsd: last });
+      }
+    }
+    return out.sort((a, b) => b.changePct - a.changePct);
+  }
+
+  // Record pools that enter the rug-watch profile (the hypothesis: do these drain?).
+  private async updateHypothesis(): Promise<void> {
+    const flagged = this.currentRugWatch();
+    if (!flagged.length) return;
+    const rw = (await this.state.storage.get<Record<string, HypMark>>("hyp_rw")) ?? {};
+    let changed = false;
+    for (const f of flagged) {
+      if (!rw[f.subject]) {
+        rw[f.subject] = { label: f.label, chain: f.chain, t: Date.now(), pct: f.changePct };
+        changed = true;
+      }
+    }
+    if (changed) await this.state.storage.put("hyp_rw", capObject(rw, HYP_CAP));
+  }
+
+  private async buildHypothesis(): Promise<{ flagged: number; flaggedDrained: number; rate: number; totalDrains: number }> {
+    const rw = (await this.state.storage.get<Record<string, HypMark>>("hyp_rw")) ?? {};
+    const dr = (await this.state.storage.get<Record<string, HypMark>>("hyp_dr")) ?? {};
+    const flaggedKeys = Object.keys(rw);
+    const drainedKeys = new Set(Object.keys(dr));
+    const flaggedDrained = flaggedKeys.filter((k) => drainedKeys.has(k)).length;
+    return {
+      flagged: flaggedKeys.length,
+      flaggedDrained,
+      rate: flaggedKeys.length ? flaggedDrained / flaggedKeys.length : 0,
+      totalDrains: drainedKeys.size,
+    };
+  }
+
   private async buildLive(): Promise<unknown> {
     const now = Date.now();
-    const movers: {
-      label: string;
-      chain: string;
-      changePct: number;
-      reserveUsd: number;
-      series: { t: number; r: number }[];
-    }[] = [];
+    const movers: { label: string; chain: string; changePct: number; reserveUsd: number; series: { t: number; r: number }[] }[] = [];
     for (const [subject, pts] of this.series) {
       if (pts.length < 2) continue;
       const first = pts[0].r;
@@ -361,37 +458,23 @@ export class RadarDO {
     movers.sort((a, b) => b.changePct - a.changePct);
     const risers = movers.filter((m) => m.changePct > 0.0005);
     const hero = risers[0] ?? movers[0] ?? null;
-    // "Rug watch": the quick-scam profile among the risers. Steep rise on a
-    // small, non-blue-chip pool. High-risk, not a guarantee; the live data
-    // measures how many actually drain (the hypothesis test).
-    const RUG_MIN_RISE = 0.5; // liquidity up >=50% over the window
-    const RUG_MAX_TVL = 750_000; // small pool; blue-chips don't rug
-    const rugWatch = risers
-      .filter((m) => m.changePct >= RUG_MIN_RISE && m.reserveUsd <= RUG_MAX_TVL)
+    const rugWatch = this.currentRugWatch()
       .slice(0, 8)
       .map((m) => ({ label: m.label, chain: m.chain, changePct: m.changePct, reserveUsd: m.reserveUsd }));
     const recent = (await this.state.storage.get<RecentEntry[]>("recent")) ?? [];
     const draining = recent
       .filter((r) => r.alert.kind === "drain" && r.reason !== "suppressed: refilled")
       .slice(0, 8)
-      .map((r) => ({
-        label: r.alert.label ?? r.alert.subject,
-        chain: r.alert.chain,
-        deltaUsd: r.alert.deltaUsd,
-        pct: r.alert.pct,
-        block: r.alert.block,
-        t: r.alert.timestamp,
-      }));
+      .map((r) => ({ label: r.alert.label ?? r.alert.subject, chain: r.alert.chain, deltaUsd: r.alert.deltaUsd, pct: r.alert.pct, block: r.alert.block, t: r.alert.timestamp }));
     const stats = (await this.state.storage.get<Stats>("stats")) ?? emptyStats(now);
     return {
       now,
       watching: this.meta.size,
-      hero: hero
-        ? { label: hero.label, chain: hero.chain, changePct: hero.changePct, series: hero.series.map((p) => ({ t: p.t, r: Math.round(p.r) })) }
-        : null,
+      hero: hero ? { label: hero.label, chain: hero.chain, changePct: hero.changePct, series: hero.series.map((p) => ({ t: p.t, r: Math.round(p.r) })) } : null,
       rising: risers.slice(0, 8).map((m) => ({ label: m.label, chain: m.chain, changePct: m.changePct, reserveUsd: m.reserveUsd })),
       rugWatch,
       draining,
+      hypothesis: await this.buildHypothesis(),
       stats: { drains: stats.drains, sent: stats.sent, suppressed: stats.suppressed },
     };
   }
@@ -405,27 +488,18 @@ export class RadarDO {
   private renderStatus(recent: RecentEntry[], gate: Gate, stats: Stats | null): string {
     const now = Date.now();
     const live = isLive(this.env);
-    const mode = live
-      ? "live, sending drains to webhook"
-      : "watch-only (no WEBHOOK_URL, catches stay on this page)";
-    const lastEvent =
-      this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
+    const mode = live ? "live, sending drains to webhook" : "watch-only (no WEBHOOK_URL)";
+    const lastEvent = this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
     const lastPost = gate.lastPostAtMs ? new Date(gate.lastPostAtMs).toISOString() : "never";
     const sentLabel = live ? "sent" : "would have sent";
     const totals = stats
-      ? `${stats.drains} confirmed drains · ${stats.sent} ${sentLabel} · ${stats.suppressed} suppressed as transient, since ${new Date(stats.sinceMs).toISOString().slice(0, 16).replace("T", " ")} UTC`
+      ? `${stats.drains} confirmed drains · ${stats.sent} ${sentLabel} · ${stats.suppressed} suppressed, since ${new Date(stats.sinceMs).toISOString().slice(0, 16).replace("T", " ")} UTC`
       : "no drains yet";
-    const paused =
-      now < gate.pausedUntilMs
-        ? `<p><strong>⏸ sending paused until ${escapeHtml(new Date(gate.pausedUntilMs).toISOString())} (webhook rate limit)</strong></p>`
-        : "";
-    const postError = gate.lastPostError
-      ? `<p>last send error: <code>${escapeHtml(gate.lastPostError)}</code></p>`
-      : "";
-    const issues =
-      this.issues.length > 0
-        ? `<h2>Recent issues</h2><ul>${this.issues.map((i) => `<li><code>${escapeHtml(i)}</code></li>`).join("")}</ul>`
-        : "";
+    const paused = now < gate.pausedUntilMs
+      ? `<p><strong>⏸ sending paused until ${escapeHtml(new Date(gate.pausedUntilMs).toISOString())}</strong></p>` : "";
+    const postError = gate.lastPostError ? `<p>last send error: <code>${escapeHtml(gate.lastPostError)}</code></p>` : "";
+    const issues = this.issues.length
+      ? `<h2>Recent issues</h2><ul>${this.issues.map((i) => `<li><code>${escapeHtml(i)}</code></li>`).join("")}</ul>` : "";
     const rows = recent
       .map((r) => {
         const a = r.alert;
@@ -434,28 +508,21 @@ export class RadarDO {
         const amount = `${a.deltaUsd < 0 ? "-" : "+"}$${Math.abs(Math.round(a.deltaUsd)).toLocaleString("en-US")}`;
         const pctText = isFinite(a.pct) ? `${(a.pct * 100).toFixed(1)}%` : "new pool";
         const when = new Date(a.timestamp * 1000).toISOString().slice(5, 16).replace("T", " ");
-        const ageH = (now / 1000 - a.timestamp) / 3600;
-        const age = ageH < 1 ? `${Math.max(0, Math.round(ageH * 60))}m ago` : `${ageH.toFixed(1)}h ago`;
         const tag = r.posted ? sentLabel : `skipped: ${r.reason}`;
-        return `<li><code>${escapeHtml(when)} UTC · ${escapeHtml(age)}</code><br>${icon} ${escapeHtml(a.label ?? a.subject)} on ${escapeHtml(a.chain)} · ${escapeHtml(amount)} (${escapeHtml(pctText)}) · block ${escapeHtml(a.block)} · <em>${escapeHtml(tag)}</em></li>`;
+        return `<li style="margin:10px 0"><code>${escapeHtml(when)} UTC</code><br>${icon} ${escapeHtml(a.label ?? a.subject)} on ${escapeHtml(a.chain)} · ${escapeHtml(amount)} (${escapeHtml(pctText)}) · block ${escapeHtml(a.block)} · <em>${escapeHtml(tag)}</em></li>`;
       })
       .join("\n");
-    return `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>LiquidityRadar</title>
+    return `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>LiquidityRadar status</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px">
-<h1>LiquidityRadar (live)</h1>
-<p>Real-time DEX liquidity-drain alerts on the free DexPaprika reserve stream. Drains are confirmed (a drop that refills is suppressed) before they post.</p>
+<h1>LiquidityRadar status</h1>
 <p>mode: <strong>${escapeHtml(mode)}</strong> · watchlist: ${escapeHtml(this.configSource)}<br>
-${escapeHtml(this.thresholds)}<br>
-last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
+${escapeHtml(this.thresholds)}<br>last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
 ${paused}${postError}
 <h2>Recent drains</h2>
-<ul style="list-style:none;padding:0">${rows ? rows.replace(/<li>/g, '<li style="margin:10px 0">') : "<li>nothing caught yet (confirmed drains are rare by design)</li>"}</ul>
+<ul style="list-style:none;padding:0">${rows || "<li>nothing caught yet</li>"}</ul>
 ${issues}
-<hr style="margin-top:32px;border:none;border-top:1px solid #ddd">
-<p style="color:#666">Powered by <a href="https://dexpaprika.com">DexPaprika</a>: free real-time DEX data, no API key needed ·
-<a href="https://docs.dexpaprika.com">streaming docs</a> ·
-<a href="https://github.com/coinpaprika/liquidity-radar">fork this radar</a></p>
+<p style="color:#666;margin-top:24px"><a href="/">← live dashboard</a> · <a href="https://github.com/coinpaprika/liquidity-radar">source</a></p>
 </body>`;
   }
 }

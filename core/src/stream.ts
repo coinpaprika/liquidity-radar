@@ -10,7 +10,12 @@ import type {
 
 export const DEFAULT_BASE_URL = "https://streaming.dexpaprika.com";
 
-/** Server-side caps: 25 subscriptions per POST connection, 10 streams per IP. */
+/**
+ * Server-side caps: 25 subscriptions per POST connection, and on the free
+ * keyless tier 3 concurrent connections per IP (probed live 2026-06-19; the 4th
+ * onward gets 429 "stream limit exceeded"). So one IP streams ~75 pools free;
+ * an enterprise key raises the connection limit, or shard across IPs.
+ */
 export const MAX_SUBSCRIPTIONS_PER_CONNECTION = 25;
 
 /**
@@ -219,7 +224,8 @@ async function* streamLoop(
 /**
  * Subscribe to a single reserve stream over GET, yielding typed events.
  * Prefer subscribeReservesMulti for more than a couple of entries, because the API
- * caps concurrent streams at 10 per IP.
+ * caps concurrent streams per IP (3 on the free tier) and one connection
+ * multiplexes up to 25 subscriptions.
  */
 export async function* subscribeReserves(
   opts: SubscribeOptions,

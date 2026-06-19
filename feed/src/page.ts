@@ -38,6 +38,12 @@ export const LANDING_HTML = `<!doctype html>
   .row .val{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums}
   .stats{display:flex;gap:18px;flex-wrap:wrap;color:var(--mut);font-size:.85em;margin:14px 2px}
   .stats b{color:var(--ink)}
+  .hyp{background:var(--surface);border:1px solid #333;border-left:4px solid var(--green);border-radius:14px;padding:14px 16px;margin:18px 0}
+  .hyp h3{margin:0 0 4px;font-size:.95em}
+  .hyp .q{color:var(--mut);font-size:.82em;font-style:italic}
+  .hyp .nums{display:flex;gap:22px;flex-wrap:wrap;margin-top:10px;font-size:.9em}
+  .hyp .nums b{color:var(--green);font-size:1.25em;font-variant-numeric:tabular-nums}
+  .hyp .nums span{display:flex;flex-direction:column;gap:2px;color:var(--mut)}
   .cta{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}
   .btn{background:var(--green);color:#06301a;font-weight:700;padding:10px 16px;border-radius:10px}
   .btn.alt{background:transparent;color:var(--green);border:1px solid var(--green)}
@@ -62,6 +68,12 @@ export const LANDING_HTML = `<!doctype html>
     <div class="card"><h3>🚩 Rug watch</h3><div id="rugwatch"><div class="empty">…</div></div>
       <div class="disc">Small alt pools building liquidity unusually fast: the classic pre-rug profile. High-risk, not a guarantee, not financial advice.</div></div>
     <div class="card"><h3>🚨 Just drained</h3><div id="draining"><div class="empty">…</div></div></div>
+  </div>
+
+  <div class="hyp">
+    <h3>📡 The experiment, live</h3>
+    <div class="q">Hypothesis: pools whose liquidity rises fastest are the ones that drain. We log every pool that enters the rug-watch profile, then count how many actually drain.</div>
+    <div class="nums" id="hyp"><span class="empty">gathering data…</span></div>
   </div>
 
   <div class="stats" id="stats"></div>
@@ -104,6 +116,14 @@ async function tick(){
     list($('rising'),d.rising,r=>'<div class="row"><span class="name">'+r.label+'</span><span class="chain">'+r.chain+'</span><span class="val up">'+pct(r.changePct)+'</span></div>');
     list($('rugwatch'),d.rugWatch||[],r=>'<div class="row"><span class="name">'+r.label+'</span><span class="chain">'+r.chain+'</span><span class="val down">'+pct(r.changePct)+' · '+usd(r.reserveUsd)+'</span></div>');
     list($('draining'),d.draining,r=>'<div class="row"><span class="name">'+r.label+'</span><span class="chain">'+r.chain+'</span><span class="val down">'+usd(r.deltaUsd)+' ('+pct(r.pct)+')</span></div>');
+    if(d.hypothesis){
+      const h=d.hypothesis;
+      $('hyp').innerHTML=
+        '<span><b>'+h.flagged+'</b> flagged as fast risers</span>'+
+        '<span><b>'+h.flaggedDrained+'</b> of those later drained</span>'+
+        '<span><b>'+(h.flagged?(h.rate*100).toFixed(0):'0')+'%</b> hit rate so far</span>'+
+        '<span><b>'+h.totalDrains+'</b> drains seen overall</span>';
+    }
     $('stats').innerHTML='<span><b>'+d.stats.drains+'</b> confirmed drains</span><span><b>'+d.stats.suppressed+'</b> suppressed as transient</span><span><b>'+d.watching+'</b> pools watched</span>';
   }catch(e){$('watching').textContent='reconnecting…'}
 }

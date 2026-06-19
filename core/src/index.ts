@@ -63,8 +63,9 @@ export interface Radar {
 
 /**
  * Watch every entry through multiplexed connections: the watchlist is chunked
- * into groups of up to 25, one POST connection each (the API caps streams at
- * 10 per IP, so per-entry connections don't scale past 10 entries).
+ * into groups of up to 25, one POST connection each. The free tier allows 3
+ * concurrent connections per IP, so ~75 entries stream from one IP; beyond that
+ * the extra connections 429 and back off until a slot frees.
  *
  * Handler errors are logged and never kill a subscription. A server-rejected
  * chunk stops permanently and reports through onFatal; the rest keep running.
