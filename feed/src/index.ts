@@ -26,6 +26,7 @@ import {
   type ReserveEvent,
 } from "../../core/src/index.js";
 import { isLive, postAlert, type SinkEnv } from "./webhook.js";
+import { LANDING_HTML } from "./page.js";
 import bundledWatchlist from "../../watchlist.json";
 
 export interface Env extends SinkEnv {
@@ -71,6 +72,7 @@ interface Pending {
 }
 
 const RECENT_CAP = 150;
+const SERIES_CAP = 120; // rolling reserve points kept per pool for the live chart
 
 interface Gate {
   posted: Record<string, number>;
@@ -102,8 +104,11 @@ export default {
     if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
     const url = new URL(req.url);
     if (url.pathname === "/health") return new Response("ok", { status: 200 });
-    if (url.pathname !== "/") return new Response("not found", { status: 404 });
+    if (!["/", "/api/live", "/status"].includes(url.pathname)) {
+      return new Response("not found", { status: 404 });
+    }
 
+    // edge-cache so many viewers polling /api/live hit cache, not the single DO
     const cache = caches.default;
     const cached = await cache.match(req);
     if (cached) return cached;
@@ -130,6 +135,8 @@ export class RadarDO {
   private issues: string[] = [];
   private lastReserve = new Map<string, number>(); // subject -> current reserve USD
   private pending = new Map<string, Pending>(); // subject -> drain awaiting confirmation
+  private series = new Map<string, { t: number; r: number }[]>(); // rolling reserves for the live chart
+  private meta = new Map<string, { label: string; chain: string }>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -141,6 +148,18 @@ export class RadarDO {
     const url = new URL(req.url);
     if (url.pathname === "/__start") return new Response("started", { status: 200 });
 
+    if (url.pathname === "/api/live") {
+      return new Response(JSON.stringify(await this.buildLive()), {
+        headers: { "content-type": "application/json", "cache-control": "public, max-age=1" },
+      });
+    }
+    if (url.pathname === "/") {
+      return new Response(LANDING_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=10" },
+      });
+    }
+
+    // /status — operator debug view
     if (this.issues.length === 0) {
       this.issues = (await this.state.storage.get<string[]>("issues")) ?? [];
     }
@@ -182,10 +201,16 @@ export class RadarDO {
 
     const radar = createRadar(config, {
       onAlert: (alert) => this.handleAlert(alert),
-      onEvent: (event) => {
+      onEvent: (event, entry) => {
         this.lastEventMs = Date.now();
         const { subject, reserve } = subjectReserve(event);
-        if (subject && Number.isFinite(reserve)) this.lastReserve.set(subject, reserve);
+        if (!subject || !Number.isFinite(reserve)) return;
+        this.lastReserve.set(subject, reserve);
+        const arr = this.series.get(subject) ?? [];
+        arr.push({ t: Math.floor(Date.now() / 1000), r: reserve });
+        if (arr.length > SERIES_CAP) arr.shift();
+        this.series.set(subject, arr);
+        this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain });
       },
       onFatal: (err, entries) =>
         this.note(
@@ -311,6 +336,64 @@ export class RadarDO {
     s.sent += d.sent ?? 0;
     s.suppressed += d.suppressed ?? 0;
     await this.state.storage.put("stats", s);
+  }
+
+  // Live dashboard state: rank pools by liquidity growth over the rolling
+  // window, pick the hero (fastest riser) with its full series, and list recent
+  // confirmed drains. Computed on demand from in-memory series + stored recent.
+  private async buildLive(): Promise<unknown> {
+    const now = Date.now();
+    const movers: {
+      label: string;
+      chain: string;
+      changePct: number;
+      reserveUsd: number;
+      series: { t: number; r: number }[];
+    }[] = [];
+    for (const [subject, pts] of this.series) {
+      if (pts.length < 2) continue;
+      const first = pts[0].r;
+      const last = pts[pts.length - 1].r;
+      if (first <= 0) continue;
+      const m = this.meta.get(subject) ?? { label: subject, chain: "?" };
+      movers.push({ label: m.label, chain: m.chain, changePct: (last - first) / first, reserveUsd: last, series: pts });
+    }
+    movers.sort((a, b) => b.changePct - a.changePct);
+    const risers = movers.filter((m) => m.changePct > 0.0005);
+    const hero = risers[0] ?? movers[0] ?? null;
+    // "Rug watch": the quick-scam profile among the risers. Steep rise on a
+    // small, non-blue-chip pool. High-risk, not a guarantee; the live data
+    // measures how many actually drain (the hypothesis test).
+    const RUG_MIN_RISE = 0.5; // liquidity up >=50% over the window
+    const RUG_MAX_TVL = 750_000; // small pool; blue-chips don't rug
+    const rugWatch = risers
+      .filter((m) => m.changePct >= RUG_MIN_RISE && m.reserveUsd <= RUG_MAX_TVL)
+      .slice(0, 8)
+      .map((m) => ({ label: m.label, chain: m.chain, changePct: m.changePct, reserveUsd: m.reserveUsd }));
+    const recent = (await this.state.storage.get<RecentEntry[]>("recent")) ?? [];
+    const draining = recent
+      .filter((r) => r.alert.kind === "drain" && r.reason !== "suppressed: refilled")
+      .slice(0, 8)
+      .map((r) => ({
+        label: r.alert.label ?? r.alert.subject,
+        chain: r.alert.chain,
+        deltaUsd: r.alert.deltaUsd,
+        pct: r.alert.pct,
+        block: r.alert.block,
+        t: r.alert.timestamp,
+      }));
+    const stats = (await this.state.storage.get<Stats>("stats")) ?? emptyStats(now);
+    return {
+      now,
+      watching: this.meta.size,
+      hero: hero
+        ? { label: hero.label, chain: hero.chain, changePct: hero.changePct, series: hero.series.map((p) => ({ t: p.t, r: Math.round(p.r) })) }
+        : null,
+      rising: risers.slice(0, 8).map((m) => ({ label: m.label, chain: m.chain, changePct: m.changePct, reserveUsd: m.reserveUsd })),
+      rugWatch,
+      draining,
+      stats: { drains: stats.drains, sent: stats.sent, suppressed: stats.suppressed },
+    };
   }
 
   private note(msg: string): void {
