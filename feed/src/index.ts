@@ -653,13 +653,27 @@ export class RadarDO {
     const draining = recent
       .filter((r) => r.alert.kind === "drain" && r.reason !== "suppressed: refilled")
       .slice(0, 8)
-      .map((r) => ({ label: r.alert.label ?? r.alert.subject, chain: r.alert.chain, deltaUsd: r.alert.deltaUsd, pct: r.alert.pct, block: r.alert.block, t: r.alert.timestamp }));
+      .map((r) => ({ id: r.alert.subject, label: r.alert.label ?? r.alert.subject, chain: r.alert.chain, deltaUsd: r.alert.deltaUsd, pct: r.alert.pct, block: r.alert.block, t: r.alert.timestamp }));
+
+    // every streamed pool's recent reserve series, for the multi-line live chart
+    const streams: { id: string; label: string; chain: string; changePct: number; pts: { t: number; r: number }[] }[] = [];
+    for (const [subject, pts] of this.series) {
+      if (pts.length < 2) continue;
+      const m = this.meta.get(subject) ?? { label: subject, chain: "?" };
+      const tail = pts.slice(-60);
+      const base = tail[0].r;
+      const changePct = base > 0 ? (tail[tail.length - 1].r - base) / base : 0;
+      streams.push({ id: subject, label: m.label, chain: m.chain, changePct, pts: tail.map((p) => ({ t: p.t, r: Math.round(p.r) })) });
+    }
+    streams.sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
+
     const stats = (await this.state.storage.get<Stats>("stats")) ?? emptyStats(now);
     return {
       now,
       watching: this.meta.size, // pools on the live reserve stream that have emitted
       scanning: this.liq.size, // pools the REST scanner is tracking for liquidity growth
       hero,
+      series: streams.slice(0, 18), // overlaid live lines
       rising,
       rugWatch,
       draining,
