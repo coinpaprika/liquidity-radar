@@ -35,10 +35,21 @@ export class StreamFatalError extends Error {
 export interface StreamOptions {
   baseUrl?: string;
   signal?: AbortSignal;
+  /**
+   * Optional DexPaprika API key. Sent as the bare `Authorization` header (no
+   * "Bearer" prefix, which trips the WAF). Lifts the per-IP stream limit from
+   * 3 concurrent connections to 7. Without it, the free keyless tier is used.
+   */
+  apiKey?: string;
   /** Transient connection errors; the stream retries with backoff after each. */
   onError?: (err: unknown) => void;
   /** Server warnings and unrecognized event types; the stream continues. */
   onWarning?: (message: string) => void;
+}
+
+/** Build request headers, adding the bare Authorization header when keyed. */
+function streamHeaders(base: Record<string, string>, apiKey?: string): Record<string, string> {
+  return apiKey ? { ...base, authorization: apiKey } : base;
 }
 
 export interface SubscribeOptions extends StreamOptions {
@@ -236,7 +247,11 @@ export async function* subscribeReserves(
     `&chain=${encodeURIComponent(opts.chain)}` +
     `&address=${encodeURIComponent(opts.address)}`;
   const stream = streamLoop(
-    () => fetch(url, { headers: { accept: "text/event-stream" }, signal: opts.signal }),
+    () =>
+      fetch(url, {
+        headers: streamHeaders({ accept: "text/event-stream" }, opts.apiKey),
+        signal: opts.signal,
+      }),
     opts,
   );
   for await (const routed of stream) yield routed.event;
@@ -276,7 +291,10 @@ export async function* subscribeReservesMulti(
     () =>
       fetch(`${base}/sse/reserves`, {
         method: "POST",
-        headers: { "content-type": "application/json", accept: "text/event-stream" },
+        headers: streamHeaders(
+          { "content-type": "application/json", accept: "text/event-stream" },
+          opts.apiKey,
+        ),
         body,
         signal: opts.signal,
       }),

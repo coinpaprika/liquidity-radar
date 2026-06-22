@@ -41,6 +41,7 @@ export interface Env extends SinkEnv {
   POOLS_PER_CHAIN?: string; // cold-start volume watchlist size per chain (default 37)
   SCAN_PAGES?: string; // pools/filter pages scanned per chain each cycle (default 6 = 600 pools/chain)
   SCAN_INTERVAL_SECONDS?: string; // liquidity scan cadence (default 60; liquidity_usd refreshes ~20-30s)
+  DEXPAPRIKA_API_KEY?: string; // optional Pro/Enterprise key: lifts the stream cap 3->7 connections
 }
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
@@ -53,7 +54,11 @@ const REFRESH_MS = 60 * 60 * 1000; // rebuild the cold-start volume watchlist ho
 // live), 25 subs each, so ~75 pools is the free ceiling; 37/chain (74 total)
 // packs into exactly 3 connections. Raise only with an enterprise key.
 const DEFAULT_PER_CHAIN = 37;
-const STREAM_TARGETS = 74; // pools handed to the reserve stream (free-tier ceiling)
+const STREAM_TARGETS = 74; // pools handed to the reserve stream on the FREE tier (3 connections)
+// With a Pro/Enterprise key the per-IP stream cap is 7 connections (probed live),
+// so ~175 pools. These are the keyed defaults; POOLS_PER_CHAIN overrides.
+const STREAM_TARGETS_KEYED = 175;
+const KEYED_PER_CHAIN = 87; // cold-start size per chain when keyed (~174 total)
 const DYNAMIC_CHAINS = ["solana", "ethereum"];
 
 // --- liquidity scanner -------------------------------------------------------
@@ -346,16 +351,28 @@ export class RadarDO {
       });
   }
 
+  // Optional Pro/Enterprise key (trimmed). Sent as the bare Authorization header
+  // on the stream; lifts the per-IP cap from 3 to 7 connections.
+  private apiKey(): string | undefined {
+    const k = this.env.DEXPAPRIKA_API_KEY?.trim();
+    return k ? k : undefined;
+  }
+  private streamTargets(): number {
+    return this.apiKey() ? STREAM_TARGETS_KEYED : STREAM_TARGETS;
+  }
+
   // Stream targets, in priority order:
   //   WATCHLIST var override -> scanner's top risers -> cold-start volume list -> bundled.
+  // The API key (if any) is attached to every variant so the radar authenticates.
   private async activeConfig(): Promise<RadarConfig> {
+    const apiKey = this.apiKey();
     if (this.env.WATCHLIST) {
       try {
         const parsed = JSON.parse(this.env.WATCHLIST);
         const errs = validateRadarConfig(parsed);
         if (errs.length) throw new Error(errs.join("; "));
         this.configSource = `WATCHLIST var (${parsed.watch.length} entries)`;
-        return parsed as RadarConfig;
+        return { ...(parsed as RadarConfig), apiKey };
       } catch (err) {
         this.note(`WATCHLIST invalid, falling back: ${String(err)}`);
       }
@@ -363,7 +380,7 @@ export class RadarDO {
     const stream = await this.state.storage.get<WatchEntry[]>("streamWatchlist");
     if (stream && stream.length) {
       this.configSource = `scanner: top ${stream.length} fastest-rising pools`;
-      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: stream };
+      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: stream, apiKey };
     }
     // cold start: stream the most active pools until the scanner has growth data
     let dyn = await this.state.storage.get<WatchEntry[]>("dynamicWatchlist");
@@ -373,10 +390,10 @@ export class RadarDO {
     }
     if (dyn && dyn.length) {
       this.configSource = `cold start: ${dyn.length} most-active pools (scanner warming up)`;
-      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: dyn };
+      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: dyn, apiKey };
     }
     this.configSource = `bundled watchlist.json (${FALLBACK_WATCHLIST.watch.length} pools)`;
-    return FALLBACK_WATCHLIST;
+    return { ...FALLBACK_WATCHLIST, apiKey };
   }
 
   private isStablePair(syms: string[]): boolean {
@@ -498,7 +515,7 @@ export class RadarDO {
     const risers = this.rankRisers();
     if (risers.length < 20) return; // not enough growth signal yet; stay on cold-start list
     const targets: WatchEntry[] = risers
-      .slice(0, STREAM_TARGETS)
+      .slice(0, this.streamTargets())
       .map((r) => ({ method: "pool_reserves", chain: r.chain, address: r.id, label: r.label }));
     const prev = (await this.state.storage.get<WatchEntry[]>("streamWatchlist")) ?? [];
     const prevSet = new Set(prev.map((w) => w.address));
@@ -516,7 +533,7 @@ export class RadarDO {
 
   // Cold-start watchlist: most active pools by volume, until the scanner ranks risers.
   private async refreshWatchlist(): Promise<boolean> {
-    const perChain = envInt(this.env.POOLS_PER_CHAIN, DEFAULT_PER_CHAIN);
+    const perChain = envInt(this.env.POOLS_PER_CHAIN, this.apiKey() ? KEYED_PER_CHAIN : DEFAULT_PER_CHAIN);
     const out: WatchEntry[] = [];
     for (const chain of DYNAMIC_CHAINS) {
       let kept = 0;
@@ -744,6 +761,7 @@ export class RadarDO {
     const now = Date.now();
     const live = isLive(this.env);
     const mode = live ? "live, sending drains to webhook" : "watch-only (no WEBHOOK_URL)";
+    const keyMode = this.apiKey() ? "Pro/Enterprise key (stream cap 7 connections)" : "free tier (stream cap 3 connections)";
     const lastEvent = this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
     const lastScan = this.lastScanMs > 0 ? `${Math.round((now - this.lastScanMs) / 1000)}s ago` : "not yet";
     const lastPost = gate.lastPostAtMs ? new Date(gate.lastPostAtMs).toISOString() : "never";
@@ -771,7 +789,8 @@ export class RadarDO {
     return `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>LiquidityRadar status</title>
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px">
 <h1>LiquidityRadar status</h1>
-<p>mode: <strong>${escapeHtml(mode)}</strong> · stream: ${escapeHtml(this.configSource)}<br>
+<p>mode: <strong>${escapeHtml(mode)}</strong> · ${escapeHtml(keyMode)}<br>
+stream: ${escapeHtml(this.configSource)}<br>
 stream health: ${this.streamStarts} starts · ${this.streamErrCount} errors${this.lastStreamErr ? ` · last err: <code>${escapeHtml(this.lastStreamErr)}</code>` : ""}<br>
 scanner: ${this.liq.size} pools tracked · last scan ${escapeHtml(lastScan)}<br>
 ${escapeHtml(this.thresholds)}<br>last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>

@@ -28,6 +28,8 @@ export { validateRadarConfig } from "./config.js";
 export interface RadarConfig extends Partial<DetectConfig> {
   watch: WatchEntry[];
   baseUrl?: string;
+  /** Optional DexPaprika API key; lifts the stream limit from 3 to 7 connections. */
+  apiKey?: string;
 }
 
 export type AlertHandler = (
@@ -103,6 +105,7 @@ export function createRadar(config: RadarConfig, handlers: RadarHandlers): Radar
     try {
       const stream = subscribeReservesMulti(entries, {
         baseUrl: config.baseUrl ?? DEFAULT_BASE_URL,
+        apiKey: config.apiKey,
         signal: controller.signal,
         onError: (err) => {
           console.error(`[${label}] ${String(err)}`);
