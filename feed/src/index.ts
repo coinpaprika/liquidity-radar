@@ -202,6 +202,7 @@ export class RadarDO {
   private radar?: Radar;
   private running = false;
   private lastEventMs = 0;
+  private lastRawMsgMs = 0; // last SSE message incl. ping (connection-liveness, vs lastEventMs)
   private lastRefreshMs = 0; // last cold-start volume rebuild
   private lastScanMs = 0; // last liquidity scan
   private lastStreamPickMs = 0; // last time the stream targets were re-evaluated
@@ -335,6 +336,9 @@ export class RadarDO {
         onFatal: (err, entries) =>
           this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
         onWarning: (msg) => this.note(msg),
+        onBeat: () => {
+          this.lastRawMsgMs = Date.now();
+        },
         onError: (err, entries) => {
           this.streamErrCount++;
           this.lastStreamErr = `${String(err).slice(0, 150)} (${entries.length}p)`;
@@ -799,6 +803,7 @@ export class RadarDO {
     const mode = live ? "live, sending drains to webhook" : "watch-only (no WEBHOOK_URL)";
     const keyMode = this.apiKey() ? "Pro/Enterprise key (stream cap 7 connections)" : "free tier (stream cap 3 connections)";
     const lastEvent = this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
+    const lastRaw = this.lastRawMsgMs > 0 ? `${Math.round((now - this.lastRawMsgMs) / 1000)}s ago` : "none yet";
     const lastScan = this.lastScanMs > 0 ? `${Math.round((now - this.lastScanMs) / 1000)}s ago` : "not yet";
     const lastPost = gate.lastPostAtMs ? new Date(gate.lastPostAtMs).toISOString() : "never";
     const sentLabel = live ? "sent" : "would have sent";
@@ -829,7 +834,7 @@ export class RadarDO {
 stream: ${escapeHtml(this.configSource)}<br>
 stream health: ${this.streamStarts} starts · ${this.streamErrCount} errors${this.lastStreamErr ? ` · last err: <code>${escapeHtml(this.lastStreamErr)}</code>` : ""}<br>
 scanner: ${this.liq.size} pools tracked · last scan ${escapeHtml(lastScan)}<br>
-${escapeHtml(this.thresholds)}<br>last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
+${escapeHtml(this.thresholds)}<br>last raw msg incl ping: ${escapeHtml(lastRaw)} · last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
 ${paused}${postError}
 <h2>Recent drains</h2>

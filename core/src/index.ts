@@ -60,6 +60,8 @@ export interface RadarHandlers {
    * socket). The chunk retries with backoff; this is for visibility/metrics.
    */
   onError?: (error: unknown, entries: WatchEntry[]) => void;
+  /** Fires on every delivered message (incl. ping): a connection-liveness signal. */
+  onBeat?: () => void;
 }
 
 export interface Radar {
@@ -107,6 +109,7 @@ export function createRadar(config: RadarConfig, handlers: RadarHandlers): Radar
         baseUrl: config.baseUrl ?? DEFAULT_BASE_URL,
         apiKey: config.apiKey,
         signal: controller.signal,
+        onBeat: handlers.onBeat,
         onError: (err) => {
           console.error(`[${label}] ${String(err)}`);
           handlers.onError?.(err, entries);

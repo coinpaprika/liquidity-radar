@@ -45,6 +45,13 @@ export interface StreamOptions {
   onError?: (err: unknown) => void;
   /** Server warnings and unrecognized event types; the stream continues. */
   onWarning?: (message: string) => void;
+  /**
+   * Fires on EVERY message the connection delivers, including pings. A
+   * liveness signal: if this never fires, the connection is delivering nothing
+   * at all (dead/frozen); if it fires but no events arrive, the connection is
+   * alive but the server isn't sending data for the subscriptions.
+   */
+  onBeat?: () => void;
 }
 
 /** Build request headers, adding the bare Authorization header when keyed. */
@@ -199,6 +206,7 @@ async function* streamLoop(
           healthy = true;
           backoff = 1000;
         }
+        opts.onBeat?.(); // any delivered message (incl. ping) = the connection is alive
         if (msg.event === "ping") continue;
         let json: any;
         try {
