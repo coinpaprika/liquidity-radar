@@ -192,7 +192,11 @@ export class RadarDO {
   private lastRefreshMs = 0; // last cold-start volume rebuild
   private lastScanMs = 0; // last liquidity scan
   private lastStreamPickMs = 0; // last time the stream targets were re-evaluated
-  private lastStreamWarnMs = 0; // throttle for stream-trouble notes
+  private lastStreamWarnMs = 0; // throttle for the silence watchdog note
+  private lastErrNoteMs = 0; // separate throttle for stream-error notes
+  private streamStarts = 0; // radar.start() invocations (detects restart churn)
+  private streamErrCount = 0; // transient stream errors observed
+  private lastStreamErr = ""; // most recent stream error (shown on /status always)
   private scanning = false;
   private configSource = "(not loaded yet)";
   private thresholds = "";
@@ -243,6 +247,7 @@ export class RadarDO {
     if (Date.now() - this.lastScanMs > scanMs) {
       await this.scanLiquidity();
       await this.maybeRepointStream();
+      await this.ensureRunning(); // if the re-point stopped the radar, restart it now (no 30s gap)
     }
     await this.updateHypothesis();
   }
@@ -300,10 +305,12 @@ export class RadarDO {
           this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
         onWarning: (msg) => this.note(msg),
         onError: (err, entries) => {
+          this.streamErrCount++;
+          this.lastStreamErr = `${String(err).slice(0, 150)} (${entries.length}p)`;
           const now = Date.now();
-          if (now - this.lastStreamWarnMs > 60_000) {
-            this.lastStreamWarnMs = now;
-            this.note(`stream chunk retrying (${entries.length}p): ${String(err).slice(0, 120)}`);
+          if (now - this.lastErrNoteMs > 60_000) {
+            this.lastErrNoteMs = now;
+            this.note(`stream error: ${this.lastStreamErr}`);
           }
         },
       });
@@ -316,6 +323,7 @@ export class RadarDO {
     }
 
     this.radar = radar;
+    this.streamStarts++;
     const thisRadar = radar;
     radar
       .start()
@@ -756,6 +764,7 @@ export class RadarDO {
 <body style="font-family:system-ui;max-width:680px;margin:40px auto;padding:0 16px">
 <h1>LiquidityRadar status</h1>
 <p>mode: <strong>${escapeHtml(mode)}</strong> · stream: ${escapeHtml(this.configSource)}<br>
+stream health: ${this.streamStarts} starts · ${this.streamErrCount} errors${this.lastStreamErr ? ` · last err: <code>${escapeHtml(this.lastStreamErr)}</code>` : ""}<br>
 scanner: ${this.liq.size} pools tracked · last scan ${escapeHtml(lastScan)}<br>
 ${escapeHtml(this.thresholds)}<br>last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
