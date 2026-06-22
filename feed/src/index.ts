@@ -43,6 +43,8 @@ export interface Env extends SinkEnv {
   SCAN_INTERVAL_SECONDS?: string; // liquidity scan cadence (default 60; liquidity_usd refreshes ~20-30s)
   DEXPAPRIKA_API_KEY?: string; // optional Pro/Enterprise key: lifts the stream cap 3->7 connections
   STREAM_MAX_AGE_SECONDS?: string; // proactively recycle the subscription this often (default 600)
+  STREAM_KEYLESS?: string; // "1": don't send the key on the STREAM (scanner still keyed). For Cloudflare
+  // Workers, where the keyed SSE delivers pings but no data (WAF on keyed stream from worker IPs).
 }
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
@@ -380,15 +382,21 @@ export class RadarDO {
     const k = this.env.DEXPAPRIKA_API_KEY?.trim();
     return k ? k : undefined;
   }
+  // The key used FOR THE STREAM specifically. STREAM_KEYLESS forces the free
+  // stream (the scanner keeps the full key) because keyed SSE from a Cloudflare
+  // Worker IP currently delivers pings but no data.
+  private streamKey(): string | undefined {
+    return this.env.STREAM_KEYLESS === "1" ? undefined : this.apiKey();
+  }
   private streamTargets(): number {
-    return this.apiKey() ? STREAM_TARGETS_KEYED : STREAM_TARGETS;
+    return this.streamKey() ? STREAM_TARGETS_KEYED : STREAM_TARGETS;
   }
 
   // Stream targets, in priority order:
   //   WATCHLIST var override -> scanner's top risers -> cold-start volume list -> bundled.
   // The API key (if any) is attached to every variant so the radar authenticates.
   private async activeConfig(): Promise<RadarConfig> {
-    const apiKey = this.apiKey();
+    const apiKey = this.streamKey();
     if (this.env.WATCHLIST) {
       try {
         const parsed = JSON.parse(this.env.WATCHLIST);
@@ -573,7 +581,7 @@ export class RadarDO {
 
   // Cold-start watchlist: most active pools by volume, until the scanner ranks risers.
   private async refreshWatchlist(): Promise<boolean> {
-    const perChain = envInt(this.env.POOLS_PER_CHAIN, this.apiKey() ? KEYED_PER_CHAIN : DEFAULT_PER_CHAIN);
+    const perChain = envInt(this.env.POOLS_PER_CHAIN, this.streamKey() ? KEYED_PER_CHAIN : DEFAULT_PER_CHAIN);
     const out: WatchEntry[] = [];
     for (const chain of DYNAMIC_CHAINS) {
       let kept = 0;
@@ -801,7 +809,9 @@ export class RadarDO {
     const now = Date.now();
     const live = isLive(this.env);
     const mode = live ? "live, sending drains to webhook" : "watch-only (no WEBHOOK_URL)";
-    const keyMode = this.apiKey() ? "Pro/Enterprise key (stream cap 7 connections)" : "free tier (stream cap 3 connections)";
+    const keyMode = this.apiKey()
+      ? `Pro key: scanner keyed${this.streamKey() ? ", stream keyed (cap 7)" : ", stream KEYLESS (cap 3; keyed SSE blocked from worker IPs)"}`
+      : "free tier (stream cap 3 connections)";
     const lastEvent = this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
     const lastRaw = this.lastRawMsgMs > 0 ? `${Math.round((now - this.lastRawMsgMs) / 1000)}s ago` : "none yet";
     const lastScan = this.lastScanMs > 0 ? `${Math.round((now - this.lastScanMs) / 1000)}s ago` : "not yet";

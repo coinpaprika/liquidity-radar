@@ -56,6 +56,14 @@ SCAN_INTERVAL_SECONDS = "60"
 # (reconnect is seamless; the metric does not drop). Default 600s.
 STREAM_MAX_AGE_SECONDS = "600"
 
+# On Cloudflare Workers the KEYED reserve stream delivers pings but no data
+# (the streaming WAF accepts an Authorization'd SSE from worker IPs but doesn't
+# feed it). So run the stream keyless here (free 3-connection tier, ~75 pools,
+# which DOES deliver from workers) while the scanner keeps the full key. Remove
+# this (or set "0") when running off Workers, or once the dev fixes keyed SSE
+# for worker egress IPs — then the stream gets 7 connections / ~175 pools.
+STREAM_KEYLESS = "1"
+
 # OPTIONAL Pro/Enterprise API key. NOT set here (it's a secret) — provide it with
 #   npx wrangler secret put DEXPAPRIKA_API_KEY
 # (local dev: put DEXPAPRIKA_API_KEY=... in a gitignored .dev.vars). When set:
