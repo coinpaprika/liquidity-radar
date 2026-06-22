@@ -21,7 +21,7 @@ export {
   type StreamOptions,
   type SubscribeOptions,
 } from "./stream.js";
-export { detect, DEFAULT_DETECT, type DetectConfig } from "./detect.js";
+export { detect, DEFAULT_DETECT, poolQuoteUsd, poolReserveUsd, QUOTE_TOKENS, type DetectConfig } from "./detect.js";
 export { DATA_CREDIT, formatAlert, usd, pct, shortAddr } from "./format.js";
 export { validateRadarConfig } from "./config.js";
 

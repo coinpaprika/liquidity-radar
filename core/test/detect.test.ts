@@ -139,3 +139,50 @@ test("formatAlert produces the canonical drain line", () => {
   assert.ok(text.includes("-$1.24M"));
   assert.ok(text.includes("block 25286203"));
 });
+
+// --- quote-token valuation (value pools by the SOL/USDC/USDT leg) ---
+const USDC_SOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const leg = (token_id: string, reserve_usd: number, delta_usd: number) => ({
+  token_id, reserve: "0", delta: "0", price_usd: 0, reserve_usd, delta_usd,
+});
+
+test("pool drain is valued by the quote leg, not the inflated total", () => {
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      total_reserve_usd: 80_000_000, // inflated by the meme leg's notional
+      total_delta_usd: -80_000_000,
+      tokens: [leg("MEMEpump", 40_000_000, -40_000_000), leg(USDC_SOL, 20_000, -20_000)],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.ok(a);
+  assert.equal(a.kind, "drain");
+  assert.equal(a.deltaUsd, -20_000); // the real USDC, not -80M
+  assert.equal(a.reserveUsd, 20_000);
+});
+
+test("a sell-swap (quote down, meme up) is not a drain", () => {
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      tokens: [leg("MEMEpump", 42_000, +22_000), leg(USDC_SOL, 20_000, -20_000)],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.equal(a, null);
+});
+
+test("meme/meme pool with no quote leg falls back to the pool total", () => {
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      total_reserve_usd: 100_000,
+      total_delta_usd: -100_000,
+      tokens: [leg("AAA", 50_000, -50_000), leg("BBB", 50_000, -50_000)],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.ok(a);
+  assert.equal(a.deltaUsd, -100_000);
+});

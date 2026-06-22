@@ -19,6 +19,7 @@ import {
   DATA_CREDIT,
   createRadar,
   formatAlert,
+  poolReserveUsd,
   validateRadarConfig,
   type Alert,
   type Radar,
@@ -91,6 +92,9 @@ const STREAM_REFRESH_MS = 5 * 60 * 1000; // re-point the stream at fresh risers 
 const STREAM_CHURN_FRACTION = 0.25; // ...and only if the target set changed by more than this
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
 const SILENCE_RESTART_MS = 150_000; // restart the subscription if it delivers NOTHING this long
+// Bump to wipe persisted state on deploy (drains/stats/hypothesis/watchlists).
+// 2026-06-22: quote-leg valuation + DAAM exclusion made the old figures invalid.
+const SCHEMA_VERSION = "2026-06-22-quote";
 const DEFAULT_STREAM_MAX_AGE_S = 600; // proactively recycle connections this often (catches a
 // single wedged chunk that the global silence timer misses, and preempts wedges before they happen)
 // DEXs whose reported reserves are accounting artifacts, not tradeable liquidity,
@@ -163,8 +167,9 @@ function escapeHtml(v: unknown): string {
   );
 }
 function subjectReserve(e: ReserveEvent): { subject: string; reserve: number } {
+  // pools are valued by their quote leg (real money), not the inflated total
   return e.type === "pool_reserves"
-    ? { subject: e.pool_id, reserve: e.total_reserve_usd }
+    ? { subject: e.pool_id, reserve: poolReserveUsd(e) }
     : { subject: e.token_id, reserve: e.reserve_usd };
 }
 function capObject<T>(obj: Record<string, T & { t: number }>, cap: number): Record<string, T & { t: number }> {
@@ -213,6 +218,7 @@ export class RadarDO {
   private streamStarts = 0; // radar.start() invocations (detects restart churn / self-heals)
   private streamErrCount = 0; // transient stream errors observed
   private lastStreamErr = ""; // most recent stream error (shown on /status always)
+  private purged = false; // one-time stale-state purge guard
   private scanning = false;
   private configSource = "(not loaded yet)";
   private thresholds = "";
@@ -300,7 +306,24 @@ export class RadarDO {
     }
   }
 
+  // Wipe persisted state once when the schema/valuation changes, so stale
+  // figures (pre-quote-valuation drains, DAAM-polluted hypothesis, old
+  // watchlist) don't linger after a deploy.
+  private async purgeIfStale(): Promise<void> {
+    if (this.purged) return;
+    this.purged = true;
+    const v = await this.state.storage.get<string>("schema");
+    if (v !== SCHEMA_VERSION) {
+      await this.state.storage.delete([
+        "recent", "stats", "hyp_rw", "hyp_dr", "streamWatchlist", "dynamicWatchlist", "scan_rising", "scan_rugwatch",
+      ]);
+      await this.state.storage.put("schema", SCHEMA_VERSION);
+      this.note(`purged stale state (schema ${v ?? "none"} -> ${SCHEMA_VERSION})`);
+    }
+  }
+
   private async ensureRunning(): Promise<void> {
+    await this.purgeIfStale();
     if ((await this.state.storage.getAlarm()) === null) {
       await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     }
