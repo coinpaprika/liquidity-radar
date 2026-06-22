@@ -52,9 +52,11 @@ SCAN_INTERVAL_SECONDS = "60"
 
 # OPTIONAL Pro/Enterprise API key. NOT set here (it's a secret) — provide it with
 #   npx wrangler secret put DEXPAPRIKA_API_KEY
-# (local dev: put DEXPAPRIKA_API_KEY=... in a gitignored .dev.vars). When set, the
-# reserve stream sends it as the bare Authorization header, lifting the per-IP cap
-# from 3 to 7 connections, and the watchlist defaults scale up (~175 pools). No
-# key = the free tier, unchanged. The key only authenticates the stream here; the
-# REST scanner stays on the free api.dexpaprika.com (api-pro's WAF can 403 from
-# Cloudflare Worker IPs, so keying the scanner needs that verified first).
+# (local dev: put DEXPAPRIKA_API_KEY=... in a gitignored .dev.vars). When set:
+#   - the reserve stream sends it as the bare Authorization header, lifting the
+#     per-IP cap from 3 to 7 connections (~175 pools), and watchlist defaults
+#     scale up;
+#   - the REST scanner switches to api-pro.dexpaprika.com (key removes the burst
+#     limit, so it scans ~12 pages/chain instead of 4). If api-pro's WAF ever
+#     403s this IP, the scan falls back to the free host automatically.
+# No key = the free tier, unchanged.

@@ -67,9 +67,13 @@ const DYNAMIC_CHAINS = ["solana", "ethereum"];
 // gentle: a REST storm here starves the stream (the actual product). Scan every
 // 2 min (liquidity_usd is a ~20-30s aggregate, so growth over 2 min is fine),
 // fewer pages, wider spacing.
-const DEFAULT_SCAN_PAGES = 4; // 100 pools/page; newest-created first
+const DEFAULT_SCAN_PAGES = 4; // 100 pools/page; newest-created first (free tier, paced)
 const DEFAULT_SCAN_INTERVAL_S = 120;
-const PAGE_SPACING_MS = 900; // pace pages: REST is a burst limiter (~30 req/20s), Retry-After 20
+const PAGE_SPACING_MS = 900; // pace pages: free REST is a burst limiter (~30 req/20s), Retry-After 20
+// With a key the REST burst limit is gone (probed: 40/40 concurrent OK on api-pro),
+// so scan far deeper and barely pace.
+const KEYED_SCAN_PAGES = 12; // ~1200 pools/chain tracked for growth
+const KEYED_PAGE_SPACING_MS = 150;
 const MAX_429_RETRIES = 2; // consecutive 429s on a page before giving up (don't freeze the alarm)
 const MAX_BACKOFF_S = 30; // cap an over-large Retry-After
 const SCAN_LIQ_MIN = 10_000; // skip dust
@@ -413,22 +417,39 @@ export class RadarDO {
     if (this.scanning) return;
     this.scanning = true;
     const now = Date.now();
-    const pages = envInt(this.env.SCAN_PAGES, DEFAULT_SCAN_PAGES);
+    const key = this.apiKey();
+    const pages = envInt(this.env.SCAN_PAGES, key ? KEYED_SCAN_PAGES : DEFAULT_SCAN_PAGES);
+    const spacing = key ? KEYED_PAGE_SPACING_MS : PAGE_SPACING_MS;
     const createdAfter = Math.floor((now - SCAN_AGE_DAYS * 86400_000) / 1000);
     const seenIds = new Set<string>(); // dedupe a pool that lands on two pages this scan
+    // Keyed: scan the pro REST host; if its WAF ever 403s this (worker) IP, fall
+    // back to the free host mid-scan so discovery never breaks.
+    let base = key ? "https://api-pro.dexpaprika.com" : "https://api.dexpaprika.com";
+    let headers: Record<string, string> = key
+      ? { accept: "application/json", authorization: key }
+      : { accept: "application/json" };
+    let usingPro = !!key;
     let seen = 0;
     try {
       for (const chain of DYNAMIC_CHAINS) {
         let retries = 0;
         for (let page = 1; page <= pages; page++) {
           const url =
-            `https://api.dexpaprika.com/networks/${chain}/pools/filter` +
+            `${base}/networks/${chain}/pools/filter` +
             `?liquidity_usd_min=${SCAN_LIQ_MIN}&liquidity_usd_max=${SCAN_LIQ_MAX}` +
             `&txns_24h_min=${SCAN_TXNS_MIN}&created_after=${createdAfter}` +
             `&sort_by=created_at&sort_dir=desc&limit=100&page=${page}`;
           let results: any[] = [];
           try {
-            const r = await fetch(url, { headers: { accept: "application/json" } });
+            const r = await fetch(url, { headers });
+            if (usingPro && (r.status === 401 || r.status === 403)) {
+              this.note(`api-pro REST blocked from this host (${r.status}); falling back to free api`);
+              base = "https://api.dexpaprika.com";
+              headers = { accept: "application/json" };
+              usingPro = false;
+              page--; // retry this page on the free host
+              continue;
+            }
             if (r.status === 429) {
               if (retries >= MAX_429_RETRIES) {
                 this.note(`scan ${chain} still 429 after ${retries} retries; skipping rest of chain`);
@@ -465,7 +486,7 @@ export class RadarDO {
             this.liq.set(id, track);
             seen++;
           }
-          await sleep(PAGE_SPACING_MS);
+          await sleep(spacing);
         }
       }
     } finally {
