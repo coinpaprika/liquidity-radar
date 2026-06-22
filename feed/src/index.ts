@@ -78,6 +78,7 @@ const RUG_MAX_TVL = 750_000; // high-risk subset: small pool + steep rise
 const STREAM_REFRESH_MS = 5 * 60 * 1000; // re-point the stream at fresh risers at most this often
 const STREAM_CHURN_FRACTION = 0.25; // ...and only if the target set changed by more than this
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
+const SILENCE_RESTART_MS = 150_000; // restart the subscription if it delivers nothing this long
 // DEXs whose reported reserves are accounting artifacts, not tradeable liquidity,
 // so they fake huge "drains" that refill: Manifest (orderbook) and Meteora DAAM
 // (dynamic vaults route reserves to lending, so total_reserve_usd swings, and it
@@ -192,9 +193,9 @@ export class RadarDO {
   private lastRefreshMs = 0; // last cold-start volume rebuild
   private lastScanMs = 0; // last liquidity scan
   private lastStreamPickMs = 0; // last time the stream targets were re-evaluated
-  private lastStreamWarnMs = 0; // throttle for the silence watchdog note
+  private streamStartedMs = 0; // when the current radar started (for silence detection)
   private lastErrNoteMs = 0; // separate throttle for stream-error notes
-  private streamStarts = 0; // radar.start() invocations (detects restart churn)
+  private streamStarts = 0; // radar.start() invocations (detects restart churn / self-heals)
   private streamErrCount = 0; // transient stream errors observed
   private lastStreamErr = ""; // most recent stream error (shown on /status always)
   private scanning = false;
@@ -239,10 +240,11 @@ export class RadarDO {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     // Keep the live stream alive FIRST: it is the product, and the scanner's
     // REST calls can back off for many seconds, which must never delay the
-    // stream from (re)starting.
+    // stream from (re)starting. The watchdog runs before ensureRunning so a
+    // wedged subscription is torn down and immediately resubscribed.
+    this.watchdogStream();
     await this.ensureRunning();
     await this.resolvePending();
-    this.watchdogStream();
     const scanMs = envInt(this.env.SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_S) * 1000;
     if (Date.now() - this.lastScanMs > scanMs) {
       await this.scanLiquidity();
@@ -252,17 +254,22 @@ export class RadarDO {
     await this.updateHypothesis();
   }
 
-  // Surface the failure mode the user hit: scanner fine, stream silent. If the
-  // radar is up but no reserve events are arriving, the egress IP is almost
-  // certainly being rate-limited (scanner + stream share it).
+  // Self-heal the failure mode the user hit: scanner fine, stream silent. A
+  // wedged subscription (connected, no error, no events) won't recover on its
+  // own, so after SILENCE_RESTART_MS we tear it down; the next ensureRunning
+  // resubscribes. streamStarts climbing while watching stays 0 means restarts
+  // don't help and the stream must move off this host.
   private watchdogStream(): void {
     if (!this.running) return;
     const now = Date.now();
-    const silentMs = this.lastEventMs ? now - this.lastEventMs : Infinity;
-    if (silentMs > 120_000 && now - this.lastStreamWarnMs > 120_000) {
-      this.lastStreamWarnMs = now;
+    const ref = this.lastEventMs || this.streamStartedMs;
+    if (!ref) return;
+    const silentMs = now - ref;
+    if (silentMs > SILENCE_RESTART_MS) {
       const since = this.lastEventMs ? `${Math.round(silentMs / 1000)}s` : "since start";
-      this.note(`stream silent ${since} while running (likely egress-IP rate limit; scanner + stream share one IP)`);
+      this.note(`stream silent ${since}; restarting the subscription`);
+      this.radar?.stop();
+      this.running = false; // next ensureRunning resubscribes
     }
   }
 
@@ -324,6 +331,7 @@ export class RadarDO {
 
     this.radar = radar;
     this.streamStarts++;
+    this.streamStartedMs = Date.now();
     const thisRadar = radar;
     radar
       .start()
