@@ -50,6 +50,12 @@ POOLS_PER_CHAIN = "37"
 SCAN_PAGES = "6"
 SCAN_INTERVAL_SECONDS = "60"
 
+# Proactively recycle the reserve-stream connections this often. A single wedged
+# connection among several healthy ones keeps the global silence timer fresh and
+# would rot undetected, so the whole subscription is re-established on this timer
+# (reconnect is seamless; the metric does not drop). Default 600s.
+STREAM_MAX_AGE_SECONDS = "600"
+
 # OPTIONAL Pro/Enterprise API key. NOT set here (it's a secret) — provide it with
 #   npx wrangler secret put DEXPAPRIKA_API_KEY
 # (local dev: put DEXPAPRIKA_API_KEY=... in a gitignored .dev.vars). When set:

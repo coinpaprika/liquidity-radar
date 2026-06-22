@@ -42,6 +42,7 @@ export interface Env extends SinkEnv {
   SCAN_PAGES?: string; // pools/filter pages scanned per chain each cycle (default 6 = 600 pools/chain)
   SCAN_INTERVAL_SECONDS?: string; // liquidity scan cadence (default 60; liquidity_usd refreshes ~20-30s)
   DEXPAPRIKA_API_KEY?: string; // optional Pro/Enterprise key: lifts the stream cap 3->7 connections
+  STREAM_MAX_AGE_SECONDS?: string; // proactively recycle the subscription this often (default 600)
 }
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
@@ -87,7 +88,9 @@ const RUG_MAX_TVL = 750_000; // high-risk subset: small pool + steep rise
 const STREAM_REFRESH_MS = 5 * 60 * 1000; // re-point the stream at fresh risers at most this often
 const STREAM_CHURN_FRACTION = 0.25; // ...and only if the target set changed by more than this
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
-const SILENCE_RESTART_MS = 150_000; // restart the subscription if it delivers nothing this long
+const SILENCE_RESTART_MS = 150_000; // restart the subscription if it delivers NOTHING this long
+const DEFAULT_STREAM_MAX_AGE_S = 600; // proactively recycle connections this often (catches a
+// single wedged chunk that the global silence timer misses, and preempts wedges before they happen)
 // DEXs whose reported reserves are accounting artifacts, not tradeable liquidity,
 // so they fake huge "drains" that refill: Manifest (orderbook) and Meteora DAAM
 // (dynamic vaults route reserves to lending, so total_reserve_usd swings, and it
@@ -271,6 +274,18 @@ export class RadarDO {
   private watchdogStream(): void {
     if (!this.running) return;
     const now = Date.now();
+    // Proactive recycle: re-establish all connections periodically. The reactive
+    // check below only sees a TOTAL wedge (global silence); a single wedged chunk
+    // among healthy ones keeps lastEventMs fresh and would rot undetected, so we
+    // recycle the whole subscription on a timer regardless of health.
+    const maxAgeMs = envInt(this.env.STREAM_MAX_AGE_SECONDS, DEFAULT_STREAM_MAX_AGE_S) * 1000;
+    if (this.streamStartedMs && now - this.streamStartedMs > maxAgeMs) {
+      this.note(`stream recycle (connections ${Math.round((now - this.streamStartedMs) / 1000)}s old)`);
+      this.radar?.stop();
+      this.running = false; // next ensureRunning resubscribes
+      return;
+    }
+    // Reactive: nothing at all for SILENCE_RESTART_MS means a total wedge.
     const ref = this.lastEventMs || this.streamStartedMs;
     if (!ref) return;
     const silentMs = now - ref;
