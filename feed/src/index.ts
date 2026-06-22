@@ -57,9 +57,14 @@ const STREAM_TARGETS = 74; // pools handed to the reserve stream (free-tier ceil
 const DYNAMIC_CHAINS = ["solana", "ethereum"];
 
 // --- liquidity scanner -------------------------------------------------------
-const DEFAULT_SCAN_PAGES = 6; // 100 pools/page; newest-created first
-const DEFAULT_SCAN_INTERVAL_S = 60;
-const PAGE_SPACING_MS = 450; // pace pages: REST is a burst limiter (~30 req/20s), Retry-After 20
+// The scanner (REST) and the live stream share one Cloudflare egress IP, and
+// DexPaprika throttles per IP. The scanner is the SECONDARY tier, so keep it
+// gentle: a REST storm here starves the stream (the actual product). Scan every
+// 2 min (liquidity_usd is a ~20-30s aggregate, so growth over 2 min is fine),
+// fewer pages, wider spacing.
+const DEFAULT_SCAN_PAGES = 4; // 100 pools/page; newest-created first
+const DEFAULT_SCAN_INTERVAL_S = 120;
+const PAGE_SPACING_MS = 900; // pace pages: REST is a burst limiter (~30 req/20s), Retry-After 20
 const MAX_429_RETRIES = 2; // consecutive 429s on a page before giving up (don't freeze the alarm)
 const MAX_BACKOFF_S = 30; // cap an over-large Retry-After
 const SCAN_LIQ_MIN = 10_000; // skip dust
@@ -73,6 +78,11 @@ const RUG_MAX_TVL = 750_000; // high-risk subset: small pool + steep rise
 const STREAM_REFRESH_MS = 5 * 60 * 1000; // re-point the stream at fresh risers at most this often
 const STREAM_CHURN_FRACTION = 0.25; // ...and only if the target set changed by more than this
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
+// DEXs whose reported reserves are accounting artifacts, not tradeable liquidity,
+// so they fake huge "drains" that refill: Manifest (orderbook) and Meteora DAAM
+// (dynamic vaults route reserves to lending, so total_reserve_usd swings, and it
+// disagrees with REST liquidity_usd by 10-50x). Excluded from scanner + stream.
+const SKIP_DEX = /manifest|daam/i;
 const STABLES = new Set([
   "USDC", "USDT", "USDG", "PYUSD", "USDS", "DAI", "USDE", "USDM", "FDUSD",
   "TUSD", "USD₮0", "USDT0", "USD₮", "BUSD", "FRAX", "GUSD", "LUSD", "USDD", "USDC.E",
@@ -182,6 +192,7 @@ export class RadarDO {
   private lastRefreshMs = 0; // last cold-start volume rebuild
   private lastScanMs = 0; // last liquidity scan
   private lastStreamPickMs = 0; // last time the stream targets were re-evaluated
+  private lastStreamWarnMs = 0; // throttle for stream-trouble notes
   private scanning = false;
   private configSource = "(not loaded yet)";
   private thresholds = "";
@@ -222,14 +233,32 @@ export class RadarDO {
 
   async alarm(): Promise<void> {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    // Keep the live stream alive FIRST: it is the product, and the scanner's
+    // REST calls can back off for many seconds, which must never delay the
+    // stream from (re)starting.
+    await this.ensureRunning();
+    await this.resolvePending();
+    this.watchdogStream();
     const scanMs = envInt(this.env.SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_S) * 1000;
     if (Date.now() - this.lastScanMs > scanMs) {
       await this.scanLiquidity();
       await this.maybeRepointStream();
     }
-    await this.ensureRunning();
     await this.updateHypothesis();
-    await this.resolvePending();
+  }
+
+  // Surface the failure mode the user hit: scanner fine, stream silent. If the
+  // radar is up but no reserve events are arriving, the egress IP is almost
+  // certainly being rate-limited (scanner + stream share it).
+  private watchdogStream(): void {
+    if (!this.running) return;
+    const now = Date.now();
+    const silentMs = this.lastEventMs ? now - this.lastEventMs : Infinity;
+    if (silentMs > 120_000 && now - this.lastStreamWarnMs > 120_000) {
+      this.lastStreamWarnMs = now;
+      const since = this.lastEventMs ? `${Math.round(silentMs / 1000)}s` : "since start";
+      this.note(`stream silent ${since} while running (likely egress-IP rate limit; scanner + stream share one IP)`);
+    }
   }
 
   private async ensureRunning(): Promise<void> {
@@ -270,6 +299,13 @@ export class RadarDO {
         onFatal: (err, entries) =>
           this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
         onWarning: (msg) => this.note(msg),
+        onError: (err, entries) => {
+          const now = Date.now();
+          if (now - this.lastStreamWarnMs > 60_000) {
+            this.lastStreamWarnMs = now;
+            this.note(`stream chunk retrying (${entries.length}p): ${String(err).slice(0, 120)}`);
+          }
+        },
       });
     } catch (err) {
       // setup failed (e.g. activeConfig fetch/storage threw); reset so the next
@@ -387,7 +423,7 @@ export class RadarDO {
             if (seenIds.has(id)) continue; // already sampled this scan: one point per pool per scan
             seenIds.add(id);
             const { syms, dex, label } = this.poolLabel(p);
-            if (/manifest/i.test(dex)) continue;
+            if (SKIP_DEX.test(dex)) continue;
             if (this.isStablePair(syms)) continue;
             const track = this.liq.get(id) ?? { label, chain, pts: [] };
             track.label = label;
@@ -485,7 +521,7 @@ export class RadarDO {
         for (const p of pools) {
           if (kept >= perChain) break;
           const { syms, dex, label } = this.poolLabel(p);
-          if (/manifest/i.test(dex)) continue;
+          if (SKIP_DEX.test(dex)) continue;
           if (this.isStablePair(syms)) continue;
           out.push({ method: "pool_reserves", chain, address: p.id, label });
           kept++;

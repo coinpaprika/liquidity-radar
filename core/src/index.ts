@@ -53,6 +53,11 @@ export interface RadarHandlers {
   onFatal?: (error: StreamFatalError, entries: WatchEntry[]) => void;
   /** Server warnings / unrecognized event types. */
   onWarning?: (message: string) => void;
+  /**
+   * Transient connection error on a chunk (e.g. a 429 rate limit or dropped
+   * socket). The chunk retries with backoff; this is for visibility/metrics.
+   */
+  onError?: (error: unknown, entries: WatchEntry[]) => void;
 }
 
 export interface Radar {
@@ -99,7 +104,10 @@ export function createRadar(config: RadarConfig, handlers: RadarHandlers): Radar
       const stream = subscribeReservesMulti(entries, {
         baseUrl: config.baseUrl ?? DEFAULT_BASE_URL,
         signal: controller.signal,
-        onError: (err) => console.error(`[${label}] ${String(err)}`),
+        onError: (err) => {
+          console.error(`[${label}] ${String(err)}`);
+          handlers.onError?.(err, entries);
+        },
         onWarning: (msg) =>
           handlers.onWarning ? handlers.onWarning(msg) : console.error(`[${label}] ${msg}`),
       });
