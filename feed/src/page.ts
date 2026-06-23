@@ -5,7 +5,7 @@
 // the whole field scrolling left in real time so it glides tick-by-tick. A
 // pool climbing is a green line rising; a pool draining stabs down in red.
 // Around it: a radar sweep, a scanline, pulsing leading dots, a live ticker,
-// numbers that count up, and rows that flash and reorder. Brand: #00FF75 neon.
+// numbers that count up, and rows that flash and reorder. Brand: #00ff88 neon (DexPaprika app palette).
 
 export const LANDING_HTML = `<!doctype html>
 <html lang="en"><head>
@@ -24,47 +24,49 @@ export const LANDING_HTML = `<!doctype html>
 <meta name="twitter:description" content="Watch DEX liquidity build and rug, live. Powered by DexPaprika.">
 <meta name="twitter:image" content="https://docs.dexpaprika.com/images/brand/dexpaprika-banner-1200x675.png">
 <style>
-  :root{--green:#00FF75;--bg:#161616;--surface:#252425;--ink:#e8e8e8;--mut:#9a9a9a;--red:#ff5c5c}
+  :root{--green:#00ff88;--green-h:#33ffaa;--bg:#050507;--bg2:#0a0b0f;--surface:#0f1018;--s3:#141620;--border:#2a2d42;--border-act:#3a3d58;--ink:#e2e8f0;--mut:#8494a7;--red:#ff4d6d;--warn:#fbbf24;--r:10px;--rs:6px;--mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+  @font-face{font-family:'DM Sans';src:url('https://static.dexpaprika.com/dexpaprika-static/assets/fonts/DMSans.woff2') format('woff2');font-weight:100 900;font-display:swap}
+  @font-face{font-family:'JetBrains Mono';src:url('https://static.dexpaprika.com/dexpaprika-static/assets/fonts/JetBrainsMono.woff2') format('woff2');font-weight:100 900;font-display:swap}
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5}
-  a{color:var(--green);text-decoration:none}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:'DM Sans',ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.5}
+  a{color:var(--green);text-decoration:none}a:hover{color:var(--green-h)}
   .wrap{max-width:1080px;margin:0 auto;padding:24px 18px 64px}
   header{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
   .logo{font-weight:800;font-size:1.5em;letter-spacing:.5px}
   .logo b{color:var(--green)}
   .tag{color:var(--mut);font-size:.95em}
   .live{margin-left:auto;display:flex;align-items:center;gap:8px;color:var(--mut);font-size:.85em}
-  .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(0,255,117,.6);animation:p 1.6s infinite}
-  @keyframes p{0%{box-shadow:0 0 0 0 rgba(0,255,117,.5)}70%{box-shadow:0 0 0 9px rgba(0,255,117,0)}100%{box-shadow:0 0 0 0 rgba(0,255,117,0)}}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(0,255,136,.6);animation:p 1.6s infinite}
+  @keyframes p{0%{box-shadow:0 0 0 0 rgba(0,255,136,.5)}70%{box-shadow:0 0 0 9px rgba(0,255,136,0)}100%{box-shadow:0 0 0 0 rgba(0,255,136,0)}}
   /* the radar disc: an always-sweeping liveness motif (it is a radar, after all) */
   .radar{position:relative;width:50px;height:50px;border-radius:50%;flex-shrink:0;overflow:hidden;
-    background:radial-gradient(circle,rgba(0,255,117,.10),transparent 72%);border:1px solid rgba(0,255,117,.28)}
+    background:radial-gradient(circle,rgba(0,255,136,.10),transparent 72%);border:1px solid rgba(0,255,136,.28)}
   .radar::before{content:"";position:absolute;inset:0;border-radius:50%;
-    background:repeating-radial-gradient(circle,transparent 0 7px,rgba(0,255,117,.10) 7px 8px)}
+    background:repeating-radial-gradient(circle,transparent 0 7px,rgba(0,255,136,.10) 7px 8px)}
   .radar::after{content:"";position:absolute;inset:-25%;
-    background:conic-gradient(from 0deg,rgba(0,255,117,.55),rgba(0,255,117,0) 26%);animation:sweep 3.2s linear infinite}
+    background:conic-gradient(from 0deg,rgba(0,255,136,.55),rgba(0,255,136,0) 26%);animation:sweep 3.2s linear infinite}
   @keyframes sweep{to{transform:rotate(360deg)}}
-  .tape{margin-top:14px;overflow:hidden;border-top:1px solid #2a2a2a;border-bottom:1px solid #2a2a2a;padding:7px 0;font-size:.8em;color:var(--mut);white-space:nowrap;-webkit-mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent);mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
+  .tape{margin-top:14px;overflow:hidden;border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:7px 0;font-size:.8em;color:var(--mut);white-space:nowrap;-webkit-mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent);mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
   .tape .run{display:inline-block;will-change:transform;animation:marq 42s linear infinite}
   .tape:hover .run{animation-play-state:paused}
   @keyframes marq{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-  .tape .chip{margin:0 16px}.tape .chip b{color:var(--green);font-variant-numeric:tabular-nums}.tape .chip.dn b{color:var(--red)}
-  .hero{background:var(--surface);border:1px solid #333;border-radius:14px;padding:18px;margin:18px 0;position:relative}
+  .tape .chip{margin:0 16px}.tape .chip b{color:var(--green);font-family:var(--mono);font-variant-numeric:tabular-nums}.tape .chip.dn b{color:var(--red)}
+  .hero{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:18px;margin:18px 0;position:relative}
   .hero .top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
   .hero h2{margin:0;font-size:1.05em}
   .hero .sub{color:var(--mut);font-size:.85em}
-  .chg{font-weight:700}.up{color:var(--green)}.down{color:var(--red)}
-  .chartwrap{position:relative;border-radius:10px;overflow:hidden;background:#101010;border:1px solid #262626}
+  .chg{font-weight:700;font-family:var(--mono)}.up{color:var(--green)}.down{color:var(--red)}
+  .chartwrap{position:relative;border-radius:var(--r);overflow:hidden;background:var(--bg2);border:1px solid var(--border)}
   .chartwrap svg{width:100%;height:340px;display:block}
   .gridbg{position:absolute;inset:0;pointer-events:none;
-    background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);
+    background-image:linear-gradient(rgba(132,148,167,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(132,148,167,.06) 1px,transparent 1px);
     background-size:100% 38px,76px 100%}
   .scanx{position:absolute;top:0;bottom:0;width:140px;pointer-events:none;
-    background:linear-gradient(90deg,transparent,rgba(0,255,117,.07),transparent);animation:scanx 4.5s linear infinite}
+    background:linear-gradient(90deg,transparent,rgba(0,255,136,.07),transparent);animation:scanx 4.5s linear infinite}
   @keyframes scanx{0%{left:-140px}100%{left:100%}}
-  .yl{position:absolute;left:6px;transform:translateY(-50%);font-size:.72em;color:var(--mut);font-variant-numeric:tabular-nums;pointer-events:none;background:rgba(16,16,16,.65);padding:0 4px;border-radius:3px;z-index:2}
+  .yl{position:absolute;left:6px;transform:translateY(-50%);font-size:.72em;color:var(--mut);font-family:var(--mono);font-variant-numeric:tabular-nums;pointer-events:none;background:rgba(5,5,7,.72);padding:0 4px;border-radius:3px;z-index:2}
   .chartwrap svg{cursor:crosshair}
-  .tip{position:absolute;pointer-events:none;display:none;z-index:3;background:rgba(20,20,20,.96);border:1px solid var(--green);border-radius:7px;padding:5px 9px;font-size:.8em;white-space:nowrap;transform:translate(-50%,calc(-100% - 12px));box-shadow:0 4px 16px rgba(0,0,0,.5)}
+  .tip{position:absolute;pointer-events:none;display:none;z-index:3;background:rgba(10,11,15,.97);border:1px solid var(--green);border-radius:var(--rs);padding:5px 9px;font-size:.8em;white-space:nowrap;transform:translate(-50%,calc(-100% - 12px));box-shadow:0 4px 16px rgba(0,0,0,.5)}
   .tip b{color:var(--green)}.tip .dn{color:var(--red)}.tip .sub{color:var(--mut);font-size:.85em}
   .xaxis{display:flex;justify-content:space-between;font-size:.72em;color:var(--mut);margin-top:5px;padding:0 2px}
   .cap{color:var(--mut);font-size:.83em;margin-top:8px;line-height:1.55}
@@ -78,28 +80,28 @@ export const LANDING_HTML = `<!doctype html>
   .legend .sw{width:14px;height:3px;border-radius:2px;display:inline-block}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:18px}
   .disc{color:var(--mut);font-size:.78em;margin-top:8px}
-  .card{background:var(--surface);border:1px solid #333;border-radius:14px;padding:14px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:14px}
   .card h3{margin:0 0 10px;font-size:.95em;display:flex;align-items:center;gap:8px}
   .ic{width:1.15em;height:1.15em;flex-shrink:0;display:inline-block;vertical-align:-.2em}
-  .row{display:flex;align-items:baseline;gap:8px;padding:7px 6px;margin:0 -6px;border-bottom:1px solid #2f2f2f;font-size:.92em;border-radius:6px}
+  .row{display:flex;align-items:baseline;gap:8px;padding:7px 6px;margin:0 -6px;border-bottom:1px solid var(--border);font-size:.92em;border-radius:var(--rs)}
   a.row{color:inherit;text-decoration:none;cursor:pointer}
-  a.row:hover{background:rgba(0,255,117,.07)}
+  a.row:hover{background:rgba(0,255,136,.07)}
   a.row::after{content:"↗";margin-left:6px;color:var(--mut);opacity:.35;font-size:.85em;align-self:center}
   a.row:hover::after{opacity:.9;color:var(--green)}
   .row:last-child{border-bottom:none}
   .row .name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .row .chain{color:var(--mut);font-size:.82em}
-  .row .val{margin-left:auto;font-weight:700;font-variant-numeric:tabular-nums}
+  .row .val{margin-left:auto;font-weight:700;font-family:var(--mono);font-variant-numeric:tabular-nums}
   .stats{display:flex;gap:18px;flex-wrap:wrap;color:var(--mut);font-size:.85em;margin:16px 2px}
-  .stats b{color:var(--ink);font-variant-numeric:tabular-nums}
-  .hyp{background:var(--surface);border:1px solid #333;border-left:4px solid var(--green);border-radius:14px;padding:14px 16px;margin:18px 0}
+  .stats b{color:var(--ink);font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .hyp{background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--green);border-radius:var(--r);padding:14px 16px;margin:18px 0}
   .hyp h3{margin:0 0 4px;font-size:.95em;display:flex;align-items:center;gap:8px}
   .hyp .q{color:var(--mut);font-size:.82em;font-style:italic}
   .hyp .nums{display:flex;gap:22px;flex-wrap:wrap;margin-top:10px;font-size:.9em}
-  .hyp .nums b{color:var(--green);font-size:1.25em;font-variant-numeric:tabular-nums}
+  .hyp .nums b{color:var(--green);font-size:1.25em;font-family:var(--mono);font-variant-numeric:tabular-nums}
   .hyp .nums span{display:flex;flex-direction:column;gap:2px;color:var(--mut)}
   .cta{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}
-  .btn{background:var(--green);color:#06301a;font-weight:700;padding:10px 16px;border-radius:10px}
+  .btn{background:var(--green);color:#06301a;font-weight:700;padding:10px 16px;border-radius:var(--r)}
   .btn.alt{background:transparent;color:var(--green);border:1px solid var(--green)}
   footer{color:var(--mut);font-size:.85em;margin-top:26px}
   .empty{color:var(--mut);font-size:.9em;padding:8px 0}
@@ -151,15 +153,15 @@ export const LANDING_HTML = `<!doctype html>
   </section>
 
   <div class="grid">
-    <div class="card"><h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#00FF75" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11l4-4 3 2.5 5-5"/><path d="M14 4.5h-3.3M14 4.5v3.3"/></svg> Fastest-rising liquidity</h3><div id="rising"><div class="empty">…</div></div>
+    <div class="card"><h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#00ff88"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg> Fastest-rising liquidity</h3><div id="rising"><div class="empty">…</div></div>
       <div class="disc">Pools whose liquidity is climbing fastest right now, scanned across thousands of pairs.</div></div>
-    <div class="card"><h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#ffb02e" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.6l6.2 10.8H1.8z"/><path d="M8 6.6v3"/><path d="M8 11.4h.01"/></svg> Rug watch</h3><div id="rugwatch"><div class="empty">…</div></div>
+    <div class="card"><h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#fbbf24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg> Rug watch</h3><div id="rugwatch"><div class="empty">…</div></div>
       <div class="disc">Small, recently-created pools building liquidity unusually fast: the classic pre-rug profile. High-risk, not a guarantee, not financial advice.</div></div>
-    <div class="card"><h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#ff5c5c" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v9"/><path d="M4 7.5l4 4 4-4"/></svg> Just drained</h3><div id="draining"><div class="empty">…</div></div></div>
+    <div class="card"><h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#ff4d6d"><polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/></svg> Just drained</h3><div id="draining"><div class="empty">…</div></div></div>
   </div>
 
   <div class="hyp">
-    <h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#00FF75" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.4" opacity=".55"/><path d="M8 8l4.3-2.7"/></svg> The experiment, live</h3>
+    <h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#00ff88"><path d="M19.07 4.93A10 10 0 0 0 6.99 3.34"/><path d="M4 6h.01"/><path d="M2.29 9.62A10 10 0 1 0 21.31 8.35"/><path d="M16.24 7.76A6 6 0 1 0 8.23 16.67"/><path d="M12 18h.01"/><path d="M17.99 11.66A6 6 0 0 1 15.77 16.67"/><circle cx="12" cy="12" r="2"/><path d="m13.41 10.59 5.66-5.66"/></svg> The experiment, live</h3>
     <div class="q">Hypothesis: pools whose liquidity rises fastest are the ones that drain. We log every pool that enters the rug-watch profile, then count how many actually drain.</div>
     <div class="nums" id="hyp"><span class="empty">gathering data…</span></div>
   </div>
@@ -215,11 +217,11 @@ function setSeries(d){
   chartState.featured=f?f.id:null;
 }
 function colorFor(l){
-  if(l.id===chartState.hoverId)return{stroke:l.draining?'#ff8a8a':'#9dffc6',w:3.4,op:1,glow:true};
-  if(l.draining)return{stroke:'#ff5c5c',w:2.6,op:.95,glow:true};
-  if(l.id===chartState.featured)return{stroke:'#00FF75',w:2.8,op:1,glow:true};
+  if(l.id===chartState.hoverId)return{stroke:l.draining?'#ff6b8a':'#7dffb0',w:3.4,op:1,glow:true};
+  if(l.draining)return{stroke:'#ff4d6d',w:2.6,op:.95,glow:true};
+  if(l.id===chartState.featured)return{stroke:'#00ff88',w:2.8,op:1,glow:true};
   const m=Math.min(.55,.22+Math.abs(l.changePct)*1.6);
-  return{stroke:'rgba(0,255,117,'+m.toFixed(2)+')',w:1.3,op:1,glow:false};
+  return{stroke:'rgba(0,255,136,'+m.toFixed(2)+')',w:1.3,op:1,glow:false};
 }
 function setYLabels(yt,yz,yb,show){for(const e of [$('y-top'),$('y-zero'),$('y-bot')])if(e)e.style.display=show?'':'none';
   if(show){$('y-top').textContent=yt.t;$('y-top').style.top=yt.y+'px';$('y-bot').textContent=yb.t;$('y-bot').style.top=yb.y+'px';
@@ -227,7 +229,7 @@ function setYLabels(yt,yz,yb,show){for(const e of [$('y-top'),$('y-zero'),$('y-b
 function drawChart(){
   const svg=$('chart');if(!svg)return;
   const lines=chartState.lines;
-  if(!lines.length){svg.innerHTML='<text x="500" y="170" fill="#6a6a6a" text-anchor="middle" font-size="15">waiting for the stream…</text>';setYLabels(0,0,0,false);return}
+  if(!lines.length){svg.innerHTML='<text x="500" y="170" fill="#8494a7" text-anchor="middle" font-size="15">waiting for the stream…</text>';setYLabels(0,0,0,false);return}
   const rightT=chartState.maxT+(performance.now()-chartState.perfAt)/1000;
   const left=rightT-WINDOW;
   chartState.viewLeft=left; // so the hover handler can map cursor x -> time
@@ -246,7 +248,7 @@ function drawChart(){
   const pulse=3.2+1.6*Math.sin(performance.now()/260);
   let g='<defs><filter id="glow" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2.4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
   // zero baseline (where every line starts)
-  if(dmn<0&&dmx>0){const y0=y(0).toFixed(1);g+='<line x1="'+PAD+'" x2="'+(W-PAD)+'" y1="'+y0+'" y2="'+y0+'" stroke="rgba(255,255,255,.14)" stroke-width="1" stroke-dasharray="4 5"/>';}
+  if(dmn<0&&dmx>0){const y0=y(0).toFixed(1);g+='<line x1="'+PAD+'" x2="'+(W-PAD)+'" y1="'+y0+'" y2="'+y0+'" stroke="rgba(132,148,167,.25)" stroke-width="1" stroke-dasharray="4 5"/>';}
   // draw crowd first, highlights last (on top)
   const rank=l=>l.id===chartState.hoverId?2:(l.draining||l.id===chartState.featured)?1:0;
   const order=lines.slice().sort((a,b)=>rank(a)-rank(b));
@@ -276,7 +278,7 @@ function renderList(elId,items,rowFn){
     if(prev){
       const now=c.getBoundingClientRect();const dy=prev.top-now.top;
       if(Math.abs(dy)>1)c.animate([{transform:'translateY('+dy+'px)'},{transform:'none'}],{duration:420,easing:'cubic-bezier(.2,.8,.2,1)'});
-      if(pv[k]!==undefined&&pv[k]!==nv[k]){const up=c.dataset.dir!=='dn';c.animate([{background:up?'rgba(0,255,117,.22)':'rgba(255,92,92,.22)'},{background:'transparent'}],{duration:850,easing:'ease-out'});}
+      if(pv[k]!==undefined&&pv[k]!==nv[k]){const up=c.dataset.dir!=='dn';c.animate([{background:up?'rgba(0,255,136,.22)':'rgba(255,92,92,.22)'},{background:'transparent'}],{duration:850,easing:'ease-out'});}
     }else{c.animate([{opacity:0,transform:'translateX(10px)'},{opacity:1,transform:'none'}],{duration:380,easing:'ease-out'});}
   });
   prevVals[elId]=nv;
@@ -303,11 +305,11 @@ function renderLegend(){
   const draining=lines.filter(l=>l.draining);
   const shown=new Set();
   let lg='';
-  if(f){lg+=chip(f,'#00FF75');shown.add(f.id);}
-  draining.slice(0,3).forEach(l=>{if(!shown.has(l.id)){lg+=chip(l,'#ff5c5c');shown.add(l.id);}});
+  if(f){lg+=chip(f,'#00ff88');shown.add(f.id);}
+  draining.slice(0,3).forEach(l=>{if(!shown.has(l.id)){lg+=chip(l,'#ff4d6d');shown.add(l.id);}});
   const rest=lines.filter(l=>!shown.has(l.id));
   if(legendExpanded){
-    rest.forEach(l=>lg+=chip(l,l.draining?'#ff5c5c':'rgba(0,255,117,.55)'));
+    rest.forEach(l=>lg+=chip(l,l.draining?'#ff4d6d':'rgba(0,255,136,.55)'));
     if(rest.length)lg+='<span class="more" onclick="toggleLegend()">show less ▴</span>';
   }else if(rest.length){
     lg+='<span class="more" onclick="toggleLegend()">+'+rest.length+' more ▾</span>';
@@ -327,7 +329,7 @@ function legendAndSub(d){
 function buildTape(d){
   const parts=[];
   (d.rising||[]).slice(0,8).forEach(r=>parts.push('<span class="chip">'+esc(r.label)+' <b>'+pct(r.changePct)+'</b></span>'));
-  const icDr='<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#ff5c5c" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v9"/><path d="M4 7.5l4 4 4-4"/></svg> ';
+  const icDr='<svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#ff4d6d"><polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/></svg> ';
   (d.draining||[]).slice(0,6).forEach(r=>parts.push('<span class="chip dn">'+icDr+esc(r.label)+' <b>'+usd(r.deltaUsd)+'</b></span>'));
   const one=parts.length?parts.join(''):'<span class="chip">scanning the chains…</span>';
   $('tape').innerHTML=one+one; // duplicated for a seamless loop
