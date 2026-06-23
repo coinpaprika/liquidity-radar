@@ -1,15 +1,19 @@
 // LiquidityRadar live feed: Cloudflare Worker + Durable Object.
 //
 // Two tiers:
-//  1. REST scanner (cheap, thousands of pools): every SCAN_INTERVAL the DO pages
-//     through the small + recently-created pools on each chain via
-//     /networks/{chain}/pools/filter, stores liquidity_usd snapshots in memory,
-//     and ranks the fastest-rising. liquidity_usd is a ~20-30s aggregate (probed),
-//     so the scan runs on a 60s cadence and growth is measured over minutes.
-//  2. Reserve stream (precious, ~74 pools): the top fastest-rising pools are put
-//     on the multiplexed reserve stream for block-level drain confirmation. So a
-//     pool the scanner flags as rising is the same pool the stream catches when it
-//     drains: flag the rise, confirm the cliff, one story.
+//  1. REST scanner = candidate DISCOVERY (cheap, thousands of pools): every
+//     SCAN_INTERVAL the DO pages through small + recently-created pools on each
+//     chain via /networks/{chain}/pools/filter and ranks them by 24h VOLUME
+//     (turnover). It does NOT try to measure liquidity growth: liquidity_usd is a
+//     coarse aggregate that barely moves minute-to-minute (calibrated live), so a
+//     "rising" signal can't be read from it. Volume is live and trustworthy, and
+//     high-turnover young pools are the rug-prone set worth watching.
+//  2. Reserve stream = the real signal (precious, ~74 pools on the free tier).
+//     Drains AND rises are both computed here, from real quote-valued reserves at
+//     block level. Stream slots are filled by PIN-THE-MOVERS + ROTATE-TO-DISCOVER:
+//     any pool currently moving (rising / draining / mid-confirmation) is pinned so
+//     it is never dropped mid-lifecycle; the rest of the slots rotate through the
+//     volume-ranked candidates so 74 slots sweep far more than 74 pools over time.
 //
 // Rug feed: posts DRAINS only, and only after a drain has held for
 // DRAIN_CONFIRM_SECONDS (a drop that refills is suppressed). POST_ADDS=1 to
@@ -84,17 +88,22 @@ const SCAN_LIQ_MIN = 10_000; // skip dust
 const SCAN_LIQ_MAX = 2_000_000; // skip blue-chips: they don't rug
 const SCAN_TXNS_MIN = 50; // must be active
 const SCAN_AGE_DAYS = 7; // recently created = rug-prone
-const LIQ_PTS_CAP = 8; // ~8 min of history per pool at 60s cadence
-const LIQ_POOLS_CAP = 3000; // tracked pools (memory bound)
-const RISE_THRESHOLD = 0.03; // >=3% growth over the window counts as "rising" (sub-1% is noise)
-const RUG_MAX_TVL = 750_000; // high-risk subset: small pool + steep rise
-const STREAM_REFRESH_MS = 5 * 60 * 1000; // re-point the stream at fresh risers at most this often
-const STREAM_CHURN_FRACTION = 0.25; // ...and only if the target set changed by more than this
+const CAND_CAP = 3000; // discovered candidate pools held in memory (bound)
+const RUG_MAX_TVL = 750_000; // high-risk subset: small pool (rug-watch + hypothesis)
+const STREAM_REFRESH_MS = 5 * 60 * 1000; // rotate/re-point the stream at most this often
+// "Rising" is read from the live stream's real quote-valued reserves, not REST.
+// A pool counts as rising when its reserve climbs >= this over the look-back.
+const STREAM_RISE_WINDOW_S = 600; // 10 min of streamed history defines the trend
+const STREAM_RISE_THRESHOLD = 0.05; // >=5% real reserve growth over the window = rising
+// A pool moving (up or down) by at least this in the window is PINNED to the
+// stream so rotation never drops it mid-move; drains awaiting confirmation pin too.
+const PIN_MOVE_THRESHOLD = 0.05;
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
 const SILENCE_RESTART_MS = 150_000; // restart the subscription if it delivers NOTHING this long
 // Bump to wipe persisted state on deploy (drains/stats/hypothesis/watchlists).
-// 2026-06-22: quote-leg valuation + DAAM exclusion made the old figures invalid.
-const SCHEMA_VERSION = "2026-06-22-quote";
+// 2026-06-23: "rising" now comes from the live stream, not REST liquidity_usd;
+// the old scan_rising/scan_rugwatch snapshots and hypothesis are invalid.
+const SCHEMA_VERSION = "2026-06-23-stream-rise";
 const DEFAULT_STREAM_MAX_AGE_S = 600; // proactively recycle connections this often (catches a
 // single wedged chunk that the global silence timer misses, and preempts wedges before they happen)
 // DEXs whose reported reserves are accounting artifacts, not tradeable liquidity,
@@ -146,13 +155,16 @@ interface Gate {
 }
 // hypothesis buckets, keyed by subject (pool id), naturally deduped
 type HypMark = { label: string; chain: string; t: number; pct: number };
-// one scanned pool's liquidity history (in memory; rebuilds after eviction)
-interface LiqTrack {
+// a discovered candidate pool (latest snapshot; the scanner overwrites each cycle).
+// volUsd (24h turnover) is the ranking key; liqUsd is kept for context only.
+interface Candidate {
   label: string;
   chain: string;
-  pts: { t: number; liq: number }[];
+  liqUsd: number;
+  volUsd: number;
+  t: number;
 }
-// a ranked riser surfaced to the page / chosen for the stream
+// a riser surfaced to the page (computed from the live stream's real reserves)
 interface Riser {
   id: string;
   label: string;
@@ -232,7 +244,8 @@ export class RadarDO {
   private pending = new Map<string, Pending>();
   private series = new Map<string, { t: number; r: number }[]>();
   private meta = new Map<string, { label: string; chain: string }>();
-  private liq = new Map<string, LiqTrack>(); // scanned pools' liquidity history
+  private candidates = new Map<string, Candidate>(); // discovered pools (rotation universe)
+  private rotateCursor = 0; // advances each repoint so rotation sweeps the universe
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -273,7 +286,7 @@ export class RadarDO {
     await this.resolvePending();
     const scanMs = envInt(this.env.SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_S) * 1000;
     if (Date.now() - this.lastScanMs > scanMs) {
-      await this.scanLiquidity();
+      await this.scanCandidates();
       await this.maybeRepointStream();
       await this.ensureRunning(); // if the re-point stopped the radar, restart it now (no 30s gap)
     }
@@ -320,7 +333,8 @@ export class RadarDO {
     const v = await this.state.storage.get<string>("schema");
     if (v !== SCHEMA_VERSION) {
       await this.state.storage.delete([
-        "recent", "stats", "hyp_rw", "hyp_dr", "streamWatchlist", "dynamicWatchlist", "scan_rising", "scan_rugwatch",
+        "recent", "stats", "hyp_rw", "hyp_dr", "streamWatchlist", "dynamicWatchlist",
+        "scan_rising", "scan_rugwatch", "rising_snapshot",
       ]);
       await this.state.storage.put("schema", SCHEMA_VERSION);
       this.note(`purged stale state (schema ${v ?? "none"} -> ${SCHEMA_VERSION})`);
@@ -438,7 +452,7 @@ export class RadarDO {
     }
     const stream = await this.state.storage.get<WatchEntry[]>("streamWatchlist");
     if (stream && stream.length) {
-      this.configSource = `scanner: top ${stream.length} fastest-rising pools`;
+      this.configSource = `stream: ${stream.length} pools (pinned movers + rotating candidates)`;
       return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: stream, apiKey };
     }
     // cold start: stream the most active pools until the scanner has growth data
@@ -464,11 +478,13 @@ export class RadarDO {
     return { syms, dex, label: `${syms.join("/")} (${dex})` };
   }
 
-  // --- tier 1: liquidity scanner --------------------------------------------
-  // Page through each chain's small + recently-created pools and record their
-  // liquidity_usd. Paced sequentially (REST is a burst limiter); Retry-After is
-  // honored with a backoff. Builds the in-memory history growth ranking reads.
-  private async scanLiquidity(): Promise<void> {
+  // --- tier 1: candidate discovery ------------------------------------------
+  // Page through each chain's small + recently-created pools and record the
+  // latest snapshot (24h volume = the ranking key). Paced sequentially (REST is a
+  // burst limiter); Retry-After is honored with a backoff. This builds the
+  // rotation universe the stream draws from; it does NOT measure growth (that
+  // comes from the live stream, since REST liquidity_usd barely moves per minute).
+  private async scanCandidates(): Promise<void> {
     if (this.scanning) return;
     this.scanning = true;
     const now = Date.now();
@@ -528,86 +544,159 @@ export class RadarDO {
           for (const p of results) {
             const id = String(p.id ?? "");
             const liq = Number(p.liquidity_usd);
+            const vol = Number(p.volume_usd_24h);
             if (!id || !Number.isFinite(liq) || liq <= 0) continue;
-            if (seenIds.has(id)) continue; // already sampled this scan: one point per pool per scan
+            if (seenIds.has(id)) continue; // count each pool once per scan
             seenIds.add(id);
             const { syms, dex, label } = this.poolLabel(p);
             if (SKIP_DEX.test(dex)) continue;
             if (this.isStablePair(syms)) continue;
-            const track = this.liq.get(id) ?? { label, chain, pts: [] };
-            track.label = label;
-            track.pts.push({ t: now, liq });
-            if (track.pts.length > LIQ_PTS_CAP) track.pts.shift();
-            this.liq.set(id, track);
+            this.candidates.set(id, {
+              label,
+              chain,
+              liqUsd: liq,
+              volUsd: Number.isFinite(vol) ? vol : 0,
+              t: now,
+            });
             seen++;
           }
           await sleep(spacing);
         }
       }
     } finally {
-      this.capLiq();
+      this.capCandidates();
       this.lastScanMs = Date.now();
       this.scanning = false;
     }
-    // persist the derived lists so /api/live survives a DO eviction
-    const risers = this.rankRisers();
-    await this.state.storage.put("scan_rising", risers.slice(0, 20));
-    await this.state.storage.put(
-      "scan_rugwatch",
-      risers.filter((r) => r.liqUsd <= RUG_MAX_TVL).slice(0, 12),
-    );
-    if (seen) this.note(`scan ok: ${seen} pool samples, ${this.liq.size} tracked`);
+    if (seen) this.note(`scan ok: ${seen} candidates this cycle, ${this.candidates.size} in universe`);
   }
 
-  private capLiq(): void {
-    if (this.liq.size <= LIQ_POOLS_CAP) return;
-    const byAge = [...this.liq.entries()].sort(
-      (a, b) => (a[1].pts.at(-1)?.t ?? 0) - (b[1].pts.at(-1)?.t ?? 0),
-    );
-    for (const [id] of byAge.slice(0, this.liq.size - LIQ_POOLS_CAP)) this.liq.delete(id);
+  private capCandidates(): void {
+    if (this.candidates.size <= CAND_CAP) return;
+    const byAge = [...this.candidates.entries()].sort((a, b) => a[1].t - b[1].t);
+    for (const [id] of byAge.slice(0, this.candidates.size - CAND_CAP)) this.candidates.delete(id);
   }
 
-  // Growth over the stored window (first -> last point), thresholded and ranked.
-  private rankRisers(): Riser[] {
+  // The real "rising" signal: read from the live stream's quote-valued reserves,
+  // not REST. growthPct is the change over STREAM_RISE_WINDOW_S; liqUsd is the
+  // current real reserve. Same trustworthy data path that catches drains.
+  private streamChange(subject: string, windowS: number): number | null {
+    const pts = this.series.get(subject);
+    if (!pts || pts.length < 3) return null;
+    const now = Math.floor(Date.now() / 1000);
+    const recent = pts.filter((p) => now - p.t <= windowS);
+    if (recent.length < 3) return null;
+    const first = recent[0].r;
+    const last = recent[recent.length - 1].r;
+    if (first <= 0) return null;
+    return (last - first) / first;
+  }
+
+  private streamRisers(): Riser[] {
     const out: Riser[] = [];
-    for (const [id, t] of this.liq) {
-      if (t.pts.length < 2) continue;
-      const first = t.pts[0].liq;
-      const last = t.pts[t.pts.length - 1].liq;
-      if (first <= 0) continue;
-      const growthPct = (last - first) / first;
-      if (growthPct >= RISE_THRESHOLD) out.push({ id, label: t.label, chain: t.chain, growthPct, liqUsd: last });
+    for (const subject of this.series.keys()) {
+      const chg = this.streamChange(subject, STREAM_RISE_WINDOW_S);
+      if (chg === null || chg < STREAM_RISE_THRESHOLD) continue;
+      const m = this.meta.get(subject) ?? { label: subject, chain: "?" };
+      out.push({ id: subject, label: m.label, chain: m.chain, growthPct: chg, liqUsd: this.lastReserve.get(subject) ?? 0 });
     }
     return out.sort((a, b) => b.growthPct - a.growthPct);
   }
 
-  // Re-point the reserve stream at the freshest risers, rate-limited and only on
-  // a material change, so we don't thrash the subscription (which would drop
-  // in-flight drain confirmation).
+  // Pools that must stay on the stream through rotation: anything moving (up or
+  // down) past PIN_MOVE_THRESHOLD in the window, plus drains mid-confirmation.
+  private pinnedIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const subject of this.pending.keys()) ids.add(subject);
+    for (const subject of this.series.keys()) {
+      const chg = this.streamChange(subject, STREAM_RISE_WINDOW_S);
+      if (chg !== null && Math.abs(chg) >= PIN_MOVE_THRESHOLD) ids.add(subject);
+    }
+    return ids;
+  }
+
+  // Build a WatchEntry for a pool id from whatever we know (stream meta first,
+  // then the candidate snapshot). Null if we can't resolve its chain.
+  private entryFor(id: string): WatchEntry | null {
+    const m = this.meta.get(id);
+    const c = this.candidates.get(id);
+    const chain = m?.chain && m.chain !== "?" ? m.chain : c?.chain;
+    if (!chain) return null;
+    return { method: "pool_reserves", chain, address: id, label: m?.label ?? c?.label ?? id };
+  }
+
+  // Drop streamed state for pools no longer watched (and not mid-confirmation),
+  // so streamRisers only reflects the current set and memory stays bounded.
+  private pruneStreamState(keep: Set<string>): void {
+    for (const k of [...this.series.keys()]) {
+      if (keep.has(k) || this.pending.has(k)) continue;
+      this.series.delete(k);
+      this.meta.delete(k);
+      this.lastReserve.delete(k);
+    }
+  }
+
+  // Re-point the reserve stream: PIN the movers, ROTATE the rest. Rate-limited so
+  // we don't thrash the subscription (a resubscribe drops in-flight non-pinned
+  // series). Pinned pools (moving / mid-confirmation) always survive; the leftover
+  // slots advance through the volume-ranked candidate universe so the fixed 74
+  // slots sweep far more than 74 pools over time.
   private async maybeRepointStream(): Promise<void> {
     if (this.env.WATCHLIST) return; // explicit override wins
     const now = Date.now();
     if (now - this.lastStreamPickMs < STREAM_REFRESH_MS) return;
-    const risers = this.rankRisers();
-    if (risers.length < 20) return; // not enough growth signal yet; stay on cold-start list
-    const targets: WatchEntry[] = risers
-      .slice(0, this.streamTargets())
-      .map((r) => ({ method: "pool_reserves", chain: r.chain, address: r.id, label: r.label }));
+    const cap = this.streamTargets();
+    // Candidate universe, ranked by 24h turnover (live, trustworthy field).
+    const ranked = [...this.candidates.entries()]
+      .map(([id, c]) => ({ id, ...c }))
+      .sort((a, b) => b.volUsd - a.volUsd);
+    if (ranked.length < cap) return; // not enough discovered yet; stay on cold-start list
+
     const prev = (await this.state.storage.get<WatchEntry[]>("streamWatchlist")) ?? [];
-    const prevSet = new Set(prev.map((w) => w.address));
-    const overlap = targets.filter((t) => prevSet.has(t.address)).length;
-    const churn = prev.length ? 1 - overlap / Math.max(targets.length, prev.length) : 1;
+    const prevById = new Map(prev.map((w) => [w.address, w] as const));
+
+    // 1. PINS: keep every pool currently mid-move so we see its whole lifecycle.
+    const targets: WatchEntry[] = [];
+    const taken = new Set<string>();
+    for (const id of this.pinnedIds()) {
+      if (targets.length >= cap) break;
+      const w = prevById.get(id) ?? this.entryFor(id);
+      if (w && !taken.has(w.address)) {
+        targets.push(w);
+        taken.add(w.address);
+      }
+    }
+    const pinned = targets.length;
+
+    // 2. ROTATION: fill the rest from the candidate list starting at a cursor that
+    //    advances each refresh, so over several refreshes we cover the universe.
+    let filled = 0;
+    if (ranked.length) {
+      for (let i = 0; i < ranked.length && targets.length < cap; i++) {
+        const c = ranked[(this.rotateCursor + i) % ranked.length];
+        if (taken.has(c.id)) continue;
+        taken.add(c.id);
+        targets.push({ method: "pool_reserves", chain: c.chain, address: c.id, label: c.label });
+        filled++;
+      }
+      this.rotateCursor = (this.rotateCursor + Math.max(filled, 1)) % ranked.length;
+    }
+
     this.lastStreamPickMs = now;
-    if (churn < STREAM_CHURN_FRACTION && prev.length) return; // close enough, leave it
+    // Nothing changed (all pins, no rotation room): skip a pointless resubscribe.
+    const sameSet = prev.length === targets.length && targets.every((t) => prevById.has(t.address));
+    if (sameSet) return;
     await this.state.storage.put("streamWatchlist", targets);
+    this.pruneStreamState(new Set(targets.map((t) => t.address)));
     if (this.running) {
-      this.radar?.stop(); // resubscribe with the fresh risers on the next ensureRunning
+      this.radar?.stop(); // resubscribe with the new target set on the next ensureRunning
       this.running = false;
     }
-    this.note(`stream re-pointed at top ${targets.length} risers (churn ${(churn * 100).toFixed(0)}%)`);
+    this.note(`stream re-pointed: ${pinned} pinned + ${filled} rotated (cursor ${this.rotateCursor}/${ranked.length})`);
   }
 
-  // Cold-start watchlist: most active pools by volume, until the scanner ranks risers.
+  // Cold-start watchlist: most active pools by volume, used until the scanner has
+  // discovered enough candidates to fill the rotate-and-pin stream selection.
   private async refreshWatchlist(): Promise<boolean> {
     const perChain = envInt(this.env.POOLS_PER_CHAIN, this.streamKey() ? KEYED_PER_CHAIN : DEFAULT_PER_CHAIN);
     const out: WatchEntry[] = [];
@@ -732,9 +821,13 @@ export class RadarDO {
     await this.state.storage.put("stats", s);
   }
 
-  // Record pools the scanner flags as steep risers (the hypothesis: do these drain?).
+  // Record pools the live stream shows rising (the hypothesis: do these drain?).
+  // Also snapshot the current risers so /api/live isn't blank right after a DO
+  // eviction wipes the in-memory series.
   private async updateHypothesis(): Promise<void> {
-    const flagged = this.rankRisers().filter((r) => r.liqUsd <= RUG_MAX_TVL);
+    const risers = this.streamRisers();
+    await this.state.storage.put("rising_snapshot", risers.slice(0, 20));
+    const flagged = risers.filter((r) => r.liqUsd > 0 && r.liqUsd <= RUG_MAX_TVL);
     if (!flagged.length) return;
     const rw = (await this.state.storage.get<Record<string, HypMark>>("hyp_rw")) ?? {};
     let changed = false;
@@ -763,13 +856,15 @@ export class RadarDO {
 
   private async buildLive(): Promise<unknown> {
     const now = Date.now();
-    // rising / rug-watch come from the scanner (thousands of pools)
-    let risers = this.rankRisers();
-    if (!risers.length) risers = (await this.state.storage.get<Riser[]>("scan_rising")) ?? [];
+    // rising / rug-watch come from the LIVE STREAM's real quote-valued reserves;
+    // the snapshot is a fallback only for the moments right after a DO eviction.
+    let risers = this.streamRisers();
+    if (!risers.length) risers = (await this.state.storage.get<Riser[]>("rising_snapshot")) ?? [];
     const rising = risers.slice(0, 12).map((r) => ({ id: r.id, label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
-    let rugList = risers.filter((r) => r.liqUsd <= RUG_MAX_TVL);
-    if (!rugList.length) rugList = (await this.state.storage.get<Riser[]>("scan_rugwatch")) ?? [];
-    const rugWatch = rugList.slice(0, 8).map((r) => ({ id: r.id, label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
+    const rugWatch = risers
+      .filter((r) => r.liqUsd > 0 && r.liqUsd <= RUG_MAX_TVL)
+      .slice(0, 8)
+      .map((r) => ({ id: r.id, label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
 
     // hero chart: the fastest-rising pool we're actually streaming (real-time series)
     let hero: { label: string; chain: string; changePct: number; series: { t: number; r: number }[] } | null = null;
@@ -816,7 +911,7 @@ export class RadarDO {
     return {
       now,
       watching: this.meta.size, // pools on the live reserve stream that have emitted
-      scanning: this.liq.size, // pools the REST scanner is tracking for liquidity growth
+      scanning: this.candidates.size, // pools the REST scanner has discovered as rotation candidates
       hero,
       series: streams.slice(0, 18), // overlaid live lines
       rising,
@@ -849,7 +944,7 @@ export class RadarDO {
       ? `${stats.drains} confirmed drains · ${stats.sent} ${sentLabel} · ${stats.suppressed} suppressed, since ${new Date(stats.sinceMs).toISOString().slice(0, 16).replace("T", " ")} UTC`
       : "no drains yet";
     const paused = now < gate.pausedUntilMs
-      ? `<p><strong>⏸ sending paused until ${escapeHtml(new Date(gate.pausedUntilMs).toISOString())}</strong></p>` : "";
+      ? `<p><strong>sending paused until ${escapeHtml(new Date(gate.pausedUntilMs).toISOString())}</strong></p>` : "";
     const postError = gate.lastPostError ? `<p>last send error: <code>${escapeHtml(gate.lastPostError)}</code></p>` : "";
     const issues = this.issues.length
       ? `<h2>Recent issues</h2><ul>${this.issues.map((i) => `<li><code>${escapeHtml(i)}</code></li>`).join("")}</ul>` : "";
@@ -857,7 +952,9 @@ export class RadarDO {
       .map((r) => {
         const a = r.alert;
         const drain = a.kind === "drain";
-        const icon = a.scope === "pool" ? (drain ? "🚨" : "🟢") : drain ? "📉" : "📈";
+        const icon = drain
+          ? `<span style="color:#ff4d6d">&#9660;</span>` // down triangle
+          : `<span style="color:#00c853">&#9650;</span>`; // up triangle
         const amount = `${a.deltaUsd < 0 ? "-" : "+"}$${Math.abs(Math.round(a.deltaUsd)).toLocaleString("en-US")}`;
         const pctText = isFinite(a.pct) ? `${(a.pct * 100).toFixed(1)}%` : "new pool";
         const when = new Date(a.timestamp * 1000).toISOString().slice(5, 16).replace("T", " ");
@@ -871,7 +968,7 @@ export class RadarDO {
 <p>mode: <strong>${escapeHtml(mode)}</strong> · ${escapeHtml(keyMode)}<br>
 stream: ${escapeHtml(this.configSource)}<br>
 stream health: ${this.streamStarts} starts · ${this.streamErrCount} errors${this.lastStreamErr ? ` · last err: <code>${escapeHtml(this.lastStreamErr)}</code>` : ""}<br>
-scanner: ${this.liq.size} pools tracked · last scan ${escapeHtml(lastScan)}<br>
+scanner: ${this.candidates.size} candidates discovered · last scan ${escapeHtml(lastScan)}<br>
 ${escapeHtml(this.thresholds)}<br>last raw msg incl ping: ${escapeHtml(lastRaw)} · last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
 ${paused}${postError}
