@@ -151,6 +151,16 @@ One file, `watchlist.json`. Forking is editing it.
 
 ## Built on DexPaprika
 
+LiquidityRadar runs entirely on free, public, keyless DexPaprika data. Live
+reserves come from the Reserve Stream, a single SSE connection
+(`POST streaming.dexpaprika.com/sse/reserves`) that multiplexes every watched
+pool, so a drain shows up the block it happens. Pool discovery uses the REST API
+(`GET /networks/{chain}/pools/filter`) to pick which pools are worth watching.
+That's the whole stack: those two calls plus one Cloudflare Worker and a Durable
+Object you deploy with a single command. No backend to run, no key to wait for.
+The same stream feeds price tickers, arbitrage bots, alert systems, whatever you
+want to build.
+
 Every number this radar shows comes from the free DexPaprika data layer:
 
 - [dexpaprika.com](https://dexpaprika.com): real-time DEX data, 35 chains

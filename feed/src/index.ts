@@ -246,6 +246,7 @@ export class RadarDO {
   private meta = new Map<string, { label: string; chain: string }>();
   private candidates = new Map<string, Candidate>(); // discovered pools (rotation universe)
   private rotateCursor = 0; // advances each repoint so rotation sweeps the universe
+  private activeAddrs = new Set<string>(); // addresses the current radar is subscribed to
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -284,6 +285,11 @@ export class RadarDO {
     this.watchdogStream();
     await this.ensureRunning();
     await this.resolvePending();
+    // Trim streamed state down to what we're actually subscribed to (+ pending),
+    // every tick. This is the ONLY prune that runs during cold start, where
+    // maybeRepointStream bails before it can prune, so without it series/meta grow
+    // unbounded as new pools emit.
+    this.pruneStreamState(this.activeAddrs);
     const scanMs = envInt(this.env.SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_S) * 1000;
     if (Date.now() - this.lastScanMs > scanMs) {
       await this.scanCandidates();
@@ -309,6 +315,7 @@ export class RadarDO {
     if (this.streamStartedMs && now - this.streamStartedMs > maxAgeMs) {
       this.note(`stream recycle (connections ${Math.round((now - this.streamStartedMs) / 1000)}s old)`);
       this.radar?.stop();
+      this.radar = undefined; // own the teardown so the old radar's finally() is a no-op
       this.running = false; // next ensureRunning resubscribes
       return;
     }
@@ -320,6 +327,7 @@ export class RadarDO {
       const since = this.lastEventMs ? `${Math.round(silentMs / 1000)}s` : "since start";
       this.note(`stream silent ${since}; restarting the subscription`);
       this.radar?.stop();
+      this.radar = undefined; // own the teardown so the old radar's finally() is a no-op
       this.running = false; // next ensureRunning resubscribes
     }
   }
@@ -352,6 +360,7 @@ export class RadarDO {
     let radar: Radar;
     try {
       const config = await this.activeConfig();
+      this.activeAddrs = new Set(config.watch.map((w) => w.address));
       const confirmS = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90);
       this.thresholds =
         `alerts on drains ≥$${(config.minUsd ?? 25000).toLocaleString("en-US")} and ≥${((config.pctThreshold ?? 0.1) * 100).toFixed(0)}% of reserve, confirmed over ${confirmS}s`;
@@ -401,6 +410,10 @@ export class RadarDO {
       return;
     }
 
+    // Re-assert running: a stopped radar's finally() (below) can fire during the
+    // await above and flip running=false. Without this, we'd return with a live
+    // radar but running=false, and the next alarm would start a duplicate.
+    this.running = true;
     this.radar = radar;
     this.streamStarts++;
     this.streamStartedMs = Date.now();
@@ -452,7 +465,7 @@ export class RadarDO {
     }
     const stream = await this.state.storage.get<WatchEntry[]>("streamWatchlist");
     if (stream && stream.length) {
-      this.configSource = `stream: ${stream.length} pools (pinned movers + rotating candidates)`;
+      this.configSource = `${stream.length} pools (pinned movers + rotating candidates)`;
       return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: stream, apiKey };
     }
     // cold start: stream the most active pools until the scanner has growth data
@@ -627,9 +640,15 @@ export class RadarDO {
 
   // Drop streamed state for pools no longer watched (and not mid-confirmation),
   // so streamRisers only reflects the current set and memory stays bounded.
+  // Compared case-insensitively: series is keyed by the stream's echoed pool_id,
+  // `keep` by the address we subscribed with, and the two can differ in case for
+  // EVM pools. A case-sensitive miss would prune a still-subscribed pool every
+  // tick and churn its history. Solana base58 keys stay matched (both lowered).
   private pruneStreamState(keep: Set<string>): void {
+    const lkeep = new Set<string>();
+    for (const a of keep) lkeep.add(a.toLowerCase());
     for (const k of [...this.series.keys()]) {
-      if (keep.has(k) || this.pending.has(k)) continue;
+      if (lkeep.has(k.toLowerCase()) || this.pending.has(k)) continue;
       this.series.delete(k);
       this.meta.delete(k);
       this.lastReserve.delete(k);
@@ -672,14 +691,18 @@ export class RadarDO {
     //    advances each refresh, so over several refreshes we cover the universe.
     let filled = 0;
     if (ranked.length) {
+      let scanned = 0;
       for (let i = 0; i < ranked.length && targets.length < cap; i++) {
+        scanned = i + 1;
         const c = ranked[(this.rotateCursor + i) % ranked.length];
         if (taken.has(c.id)) continue;
         taken.add(c.id);
         targets.push({ method: "pool_reserves", chain: c.chain, address: c.id, label: c.label });
         filled++;
       }
-      this.rotateCursor = (this.rotateCursor + Math.max(filled, 1)) % ranked.length;
+      // advance past everything examined (incl. pinned/taken pools skipped here),
+      // so the next refresh starts on fresh candidates instead of re-scanning them
+      this.rotateCursor = (this.rotateCursor + Math.max(scanned, 1)) % ranked.length;
     }
 
     this.lastStreamPickMs = now;
@@ -690,6 +713,7 @@ export class RadarDO {
     this.pruneStreamState(new Set(targets.map((t) => t.address)));
     if (this.running) {
       this.radar?.stop(); // resubscribe with the new target set on the next ensureRunning
+      this.radar = undefined; // own the teardown so the old radar's finally() is a no-op
       this.running = false;
     }
     this.note(`stream re-pointed: ${pinned} pinned + ${filled} rotated (cursor ${this.rotateCursor}/${ranked.length})`);
