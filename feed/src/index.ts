@@ -640,9 +640,15 @@ export class RadarDO {
 
   // Drop streamed state for pools no longer watched (and not mid-confirmation),
   // so streamRisers only reflects the current set and memory stays bounded.
+  // Compared case-insensitively: series is keyed by the stream's echoed pool_id,
+  // `keep` by the address we subscribed with, and the two can differ in case for
+  // EVM pools. A case-sensitive miss would prune a still-subscribed pool every
+  // tick and churn its history. Solana base58 keys stay matched (both lowered).
   private pruneStreamState(keep: Set<string>): void {
+    const lkeep = new Set<string>();
+    for (const a of keep) lkeep.add(a.toLowerCase());
     for (const k of [...this.series.keys()]) {
-      if (keep.has(k) || this.pending.has(k)) continue;
+      if (lkeep.has(k.toLowerCase()) || this.pending.has(k)) continue;
       this.series.delete(k);
       this.meta.delete(k);
       this.lastReserve.delete(k);
