@@ -89,6 +89,23 @@ they reach your webhook:
 - changing thresholds starts a fresh catch epoch so the page always reads as
   one coherent experiment
 
+### Choosing what to watch
+
+The free reserve stream holds about 74 pools at once (three connections, 25
+subscriptions each). LiquidityRadar fills those slots in two stages. A cheap
+REST scanner *discovers candidates*: young, active, small-to-mid pools, ranked
+by 24h volume. It does not read growth from REST, because `liquidity_usd`
+barely moves minute to minute. The stream then *pins the movers*, any pool
+currently rising, draining, or mid-confirmation, so none is dropped mid-event,
+and *rotates the rest* through the candidate list. A cursor advances every five
+minutes, so 74 slots sweep far more than 74 pools over time.
+
+"Rising" and "draining" are both read from the stream's real, quote-valued
+reserves, the same data path that confirms a drain. A pool that pumps then
+dumps is flagged by the same eyes that catch the cliff. An API key lifts the
+cap to roughly 175 pools, but nothing here needs one: the design stands on the
+free tier.
+
 ## What it costs to run
 
 CLI: nothing. The API is free and keyless. The 24/7 feed: an always-on DO

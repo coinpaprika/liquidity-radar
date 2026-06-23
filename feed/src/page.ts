@@ -154,7 +154,7 @@ export const LANDING_HTML = `<!doctype html>
 
   <div class="grid">
     <div class="card"><h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#00ff88"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg> Fastest-rising liquidity</h3><div id="rising"><div class="empty">…</div></div>
-      <div class="disc">Pools whose liquidity is climbing fastest right now, scanned across thousands of pairs.</div></div>
+      <div class="disc">Pools whose real reserves are climbing fastest right now, measured live on the reserve stream.</div></div>
     <div class="card"><h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#fbbf24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg> Rug watch</h3><div id="rugwatch"><div class="empty">…</div></div>
       <div class="disc">Small, recently-created pools building liquidity unusually fast: the classic pre-rug profile. High-risk, not a guarantee, not financial advice.</div></div>
     <div class="card"><h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#ff4d6d"><polyline points="22 17 13.5 8.5 8.5 13.5 2 7"/><polyline points="16 17 22 17 22 11"/></svg> Just drained</h3><div id="draining"><div class="empty">…</div></div></div>
@@ -338,7 +338,7 @@ function buildTape(d){
 async function tick(){
   try{
     const d=await (await fetch('/api/live',{cache:'no-store'})).json();
-    num('watching',d.scanning||0,v=>Math.round(v).toLocaleString()+' pools scanned · '+(d.watching||0)+' streamed live');
+    num('watching',d.scanning||0,v=>Math.round(v).toLocaleString()+' pools discovered · '+(d.watching||0)+' streamed live');
     setSeries(d);legendAndSub(d);buildTape(d);
     renderList('rising',d.rising||[],rowRise);
     renderList('rugwatch',d.rugWatch||[],rowRug);
@@ -348,7 +348,7 @@ async function tick(){
       num('hf',h.flagged,v=>Math.round(v));num('hd',h.flaggedDrained,v=>Math.round(v));
       num('hr',h.flagged?h.rate*100:0,v=>Math.round(v)+'%');num('ht',h.totalDrains,v=>Math.round(v));
     }
-    if(!$('sd'))$('stats').innerHTML='<span><b id="sd">0</b> confirmed drains</span><span><b id="ss">0</b> suppressed as transient</span><span><b id="sc">0</b> pools scanned for liquidity growth</span>';
+    if(!$('sd'))$('stats').innerHTML='<span><b id="sd">0</b> confirmed drains</span><span><b id="ss">0</b> suppressed as transient</span><span><b id="sc">0</b> pools discovered as candidates</span>';
     num('sd',d.stats.drains,v=>Math.round(v));num('ss',d.stats.suppressed,v=>Math.round(v));num('sc',d.scanning||0,v=>Math.round(v).toLocaleString());
   }catch(e){$('watching').textContent='reconnecting…'}
 }
