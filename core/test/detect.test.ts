@@ -139,3 +139,69 @@ test("formatAlert produces the canonical drain line", () => {
   assert.ok(text.includes("-$1.24M"));
   assert.ok(text.includes("block 25286203"));
 });
+
+// --- quote-token valuation (value pools by the SOL/USDC/USDT leg) ---
+const USDC_SOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const leg = (token_id: string, reserve_usd: number, delta_usd: number) => ({
+  token_id, reserve: "0", delta: "0", price_usd: 0, reserve_usd, delta_usd,
+});
+
+test("pool drain is valued by the quote leg, not the inflated total", () => {
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      total_reserve_usd: 80_000_000, // inflated by the meme leg's notional
+      total_delta_usd: -80_000_000,
+      tokens: [leg("MEMEpump", 40_000_000, -40_000_000), leg(USDC_SOL, 20_000, -20_000)],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.ok(a);
+  assert.equal(a.kind, "drain");
+  assert.equal(a.deltaUsd, -20_000); // the real USDC, not -80M
+  assert.equal(a.reserveUsd, 20_000);
+});
+
+test("a sell-swap (quote down, meme up) is not a drain", () => {
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      tokens: [leg("MEMEpump", 42_000, +22_000), leg(USDC_SOL, 20_000, -20_000)],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.equal(a, null);
+});
+
+test("meme/meme pool with no quote leg falls back to the pool total", () => {
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      total_reserve_usd: 100_000,
+      total_delta_usd: -100_000,
+      tokens: [leg("AAA", 50_000, -50_000), leg("BBB", 50_000, -50_000)],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.ok(a);
+  assert.equal(a.deltaUsd, -100_000);
+});
+
+// USDC/mUSD (two stablecoins): with both legs recognized as quote, a swap that
+// drains the USDC leg but fills the mUSD leg nets ~0 and is NOT a drain.
+const MUSD = "0xaca92e438df0b2401ff60da7e4337b687a2435da";
+test("a stable/stable swap (USDC out, mUSD in) is not a drain", () => {
+  const a = detect(
+    poolEvent({
+      chain: "ethereum",
+      total_reserve_usd: 3_900_000,
+      total_delta_usd: -200,
+      tokens: [
+        leg("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 712_000, -400_000), // USDC leg drops hard
+        leg(MUSD, 3_175_000, 399_800), // mUSD leg fills (swap)
+      ],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.equal(a, null); // both quote legs net ~0 -> not a drain
+});

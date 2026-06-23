@@ -30,3 +30,47 @@ crons = ["*/5 * * * *"] # bootstraps the DO after deploy, keeps it alive
 [vars]
 POST_COOLDOWN_MINUTES = "30"
 POSTS_PER_HOUR = "6"
+DRAIN_CONFIRM_SECONDS = "90"   # a drain must hold this long before it posts; a drop that refills is suppressed
+POST_ADDS = "0"                # rug feed: drains only. set "1" to also post liquidity adds
+
+# Cold-start stream watchlist size per chain. Used only until the liquidity
+# scanner has growth data, then the stream re-points at the fastest-rising pools.
+# The free keyless reserve stream allows 3 connections per IP (probed live), 25
+# subs each, so ~74 pools is the free ceiling; 37/chain packs into exactly 3
+# connections. Bump only with an enterprise key that lifts the stream limit.
+POOLS_PER_CHAIN = "37"
+
+# Liquidity scanner (tier 1): every SCAN_INTERVAL_SECONDS the DO pages through
+# each chain's small + recently-created pools via /pools/filter and records
+# liquidity_usd, then ranks the fastest-rising and hands the top ~74 to the
+# reserve stream. liquidity_usd is a ~20-30s aggregate (probed), so polling
+# faster than ~30s just re-reads the same numbers; 60s is the sweet spot.
+# SCAN_PAGES x 100 = pools scanned per chain per cycle. REST is a burst limiter
+# (~30 req / 20s window), so pages are paced; keep SCAN_PAGES modest.
+SCAN_PAGES = "6"
+SCAN_INTERVAL_SECONDS = "60"
+
+# Proactively recycle the reserve-stream connections this often. A single wedged
+# connection among several healthy ones keeps the global silence timer fresh and
+# would rot undetected, so the whole subscription is re-established on this timer
+# (reconnect is seamless; the metric does not drop). Default 600s.
+STREAM_MAX_AGE_SECONDS = "600"
+
+# On Cloudflare Workers the KEYED reserve stream delivers pings but no data
+# (the streaming WAF accepts an Authorization'd SSE from worker IPs but doesn't
+# feed it). So run the stream keyless here (free 3-connection tier, ~75 pools,
+# which DOES deliver from workers) while the scanner keeps the full key. Remove
+# this (or set "0") when running off Workers, or once the dev fixes keyed SSE
+# for worker egress IPs — then the stream gets 7 connections / ~175 pools.
+STREAM_KEYLESS = "1"
+
+# OPTIONAL Pro/Enterprise API key. NOT set here (it's a secret) — provide it with
+#   npx wrangler secret put DEXPAPRIKA_API_KEY
+# (local dev: put DEXPAPRIKA_API_KEY=... in a gitignored .dev.vars). When set:
+#   - the reserve stream sends it as the bare Authorization header, lifting the
+#     per-IP cap from 3 to 7 connections (~175 pools), and watchlist defaults
+#     scale up;
+#   - the REST scanner switches to api-pro.dexpaprika.com (key removes the burst
+#     limit, so it scans ~12 pages/chain instead of 4). If api-pro's WAF ever
+#     403s this IP, the scan falls back to the free host automatically.
+# No key = the free tier, unchanged.

@@ -21,13 +21,15 @@ export {
   type StreamOptions,
   type SubscribeOptions,
 } from "./stream.js";
-export { detect, DEFAULT_DETECT, type DetectConfig } from "./detect.js";
+export { detect, DEFAULT_DETECT, poolQuoteUsd, poolReserveUsd, QUOTE_TOKENS, type DetectConfig } from "./detect.js";
 export { DATA_CREDIT, formatAlert, usd, pct, shortAddr } from "./format.js";
 export { validateRadarConfig } from "./config.js";
 
 export interface RadarConfig extends Partial<DetectConfig> {
   watch: WatchEntry[];
   baseUrl?: string;
+  /** Optional DexPaprika API key; lifts the stream limit from 3 to 7 connections. */
+  apiKey?: string;
 }
 
 export type AlertHandler = (
@@ -53,6 +55,13 @@ export interface RadarHandlers {
   onFatal?: (error: StreamFatalError, entries: WatchEntry[]) => void;
   /** Server warnings / unrecognized event types. */
   onWarning?: (message: string) => void;
+  /**
+   * Transient connection error on a chunk (e.g. a 429 rate limit or dropped
+   * socket). The chunk retries with backoff; this is for visibility/metrics.
+   */
+  onError?: (error: unknown, entries: WatchEntry[]) => void;
+  /** Fires on every delivered message (incl. ping): a connection-liveness signal. */
+  onBeat?: () => void;
 }
 
 export interface Radar {
@@ -63,8 +72,9 @@ export interface Radar {
 
 /**
  * Watch every entry through multiplexed connections: the watchlist is chunked
- * into groups of up to 25, one POST connection each (the API caps streams at
- * 10 per IP, so per-entry connections don't scale past 10 entries).
+ * into groups of up to 25, one POST connection each. The free tier allows 3
+ * concurrent connections per IP, so ~75 entries stream from one IP; beyond that
+ * the extra connections 429 and back off until a slot frees.
  *
  * Handler errors are logged and never kill a subscription. A server-rejected
  * chunk stops permanently and reports through onFatal; the rest keep running.
@@ -97,8 +107,13 @@ export function createRadar(config: RadarConfig, handlers: RadarHandlers): Radar
     try {
       const stream = subscribeReservesMulti(entries, {
         baseUrl: config.baseUrl ?? DEFAULT_BASE_URL,
+        apiKey: config.apiKey,
         signal: controller.signal,
-        onError: (err) => console.error(`[${label}] ${String(err)}`),
+        onBeat: handlers.onBeat,
+        onError: (err) => {
+          console.error(`[${label}] ${String(err)}`);
+          handlers.onError?.(err, entries);
+        },
         onWarning: (msg) =>
           handlers.onWarning ? handlers.onWarning(msg) : console.error(`[${label}] ${msg}`),
       });

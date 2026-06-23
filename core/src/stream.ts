@@ -10,7 +10,12 @@ import type {
 
 export const DEFAULT_BASE_URL = "https://streaming.dexpaprika.com";
 
-/** Server-side caps: 25 subscriptions per POST connection, 10 streams per IP. */
+/**
+ * Server-side caps: 25 subscriptions per POST connection, and on the free
+ * keyless tier 3 concurrent connections per IP (probed live 2026-06-19; the 4th
+ * onward gets 429 "stream limit exceeded"). So one IP streams ~75 pools free;
+ * an enterprise key raises the connection limit, or shard across IPs.
+ */
 export const MAX_SUBSCRIPTIONS_PER_CONNECTION = 25;
 
 /**
@@ -30,10 +35,28 @@ export class StreamFatalError extends Error {
 export interface StreamOptions {
   baseUrl?: string;
   signal?: AbortSignal;
+  /**
+   * Optional DexPaprika API key. Sent as the bare `Authorization` header (no
+   * "Bearer" prefix, which trips the WAF). Lifts the per-IP stream limit from
+   * 3 concurrent connections to 7. Without it, the free keyless tier is used.
+   */
+  apiKey?: string;
   /** Transient connection errors; the stream retries with backoff after each. */
   onError?: (err: unknown) => void;
   /** Server warnings and unrecognized event types; the stream continues. */
   onWarning?: (message: string) => void;
+  /**
+   * Fires on EVERY message the connection delivers, including pings. A
+   * liveness signal: if this never fires, the connection is delivering nothing
+   * at all (dead/frozen); if it fires but no events arrive, the connection is
+   * alive but the server isn't sending data for the subscriptions.
+   */
+  onBeat?: () => void;
+}
+
+/** Build request headers, adding the bare Authorization header when keyed. */
+function streamHeaders(base: Record<string, string>, apiKey?: string): Record<string, string> {
+  return apiKey ? { ...base, authorization: apiKey } : base;
 }
 
 export interface SubscribeOptions extends StreamOptions {
@@ -183,6 +206,7 @@ async function* streamLoop(
           healthy = true;
           backoff = 1000;
         }
+        opts.onBeat?.(); // any delivered message (incl. ping) = the connection is alive
         if (msg.event === "ping") continue;
         let json: any;
         try {
@@ -219,7 +243,8 @@ async function* streamLoop(
 /**
  * Subscribe to a single reserve stream over GET, yielding typed events.
  * Prefer subscribeReservesMulti for more than a couple of entries, because the API
- * caps concurrent streams at 10 per IP.
+ * caps concurrent streams per IP (3 on the free tier) and one connection
+ * multiplexes up to 25 subscriptions.
  */
 export async function* subscribeReserves(
   opts: SubscribeOptions,
@@ -230,7 +255,11 @@ export async function* subscribeReserves(
     `&chain=${encodeURIComponent(opts.chain)}` +
     `&address=${encodeURIComponent(opts.address)}`;
   const stream = streamLoop(
-    () => fetch(url, { headers: { accept: "text/event-stream" }, signal: opts.signal }),
+    () =>
+      fetch(url, {
+        headers: streamHeaders({ accept: "text/event-stream" }, opts.apiKey),
+        signal: opts.signal,
+      }),
     opts,
   );
   for await (const routed of stream) yield routed.event;
@@ -270,7 +299,10 @@ export async function* subscribeReservesMulti(
     () =>
       fetch(`${base}/sse/reserves`, {
         method: "POST",
-        headers: { "content-type": "application/json", accept: "text/event-stream" },
+        headers: streamHeaders(
+          { "content-type": "application/json", accept: "text/event-stream" },
+          opts.apiKey,
+        ),
         body,
         signal: opts.signal,
       }),

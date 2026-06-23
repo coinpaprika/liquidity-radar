@@ -5,26 +5,8 @@
     {
       "method": "pool_reserves",
       "chain": "ethereum",
-      "address": "0x0fb0e40cec3bb23e13abc585958a93c796fbea56955e19a23727a716a0423239",
-      "label": "USDC/USDT (Uniswap V4)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "ethereum",
-      "address": "0x3b1b1f2e775a6db1664f8e7d59ad568605ea2406312c11aef03146c0cf89d5b9",
-      "label": "USDT/USDS (Uniswap V4)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "ethereum",
       "address": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
       "label": "USDC/WETH (Uniswap V3)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "ethereum",
-      "address": "0xa632d59b9b804a956bfaa9b48af3a1b74808fc1f",
-      "label": "PYUSD/USDS (Curve)"
     },
     {
       "method": "pool_reserves",
@@ -37,24 +19,6 @@
       "chain": "solana",
       "address": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
       "label": "SOL/USDC (Orca)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "solana",
-      "address": "8sjV1AqBFvFuADBCQHhotaRq5DFFYSjjg1jMyVWMqXvZ",
-      "label": "USDT/USDC (Manifest)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "solana",
-      "address": "GVJfHJsvrsWZmVj2JVQ3KyY1n7azyi8Z2FdBPxucUe58",
-      "label": "PYUSD/USDC (Manifest)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "solana",
-      "address": "EXMcKF76kmBUH8xZ5fi1jv3ezh3eVQCeL4rQbpjCRxvF",
-      "label": "USDG/USDC (Manifest)"
     },
     {
       "method": "pool_reserves",
@@ -79,12 +43,6 @@
       "chain": "base",
       "address": "0x70acdf2ad0bf2402c957154f944c19ef4e1cbae1",
       "label": "WETH/cbBTC (Aerodrome SlipStream)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "base",
-      "address": "0xa41bc0affba7fd420d186b84899d7ab2ac57fcd1",
-      "label": "USDC/USDT (Aerodrome SlipStream)"
     },
     {
       "method": "pool_reserves",
@@ -145,18 +103,6 @@
       "chain": "arbitrum",
       "address": "0x5969efdde3cf5c0d9a88ae51e47d721096a97203",
       "label": "WBTC/USD\u20ae0 (Uniswap V3)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "arbitrum",
-      "address": "0xab05003a63d2f34ac7eec4670bca3319f0e3d2f62af5c2b9cbd69d03fd804fd2",
-      "label": "USDC/USD\u20ae0 (Uniswap V4)"
-    },
-    {
-      "method": "pool_reserves",
-      "chain": "sui",
-      "address": "0xb8a67c149fd1bc7f9aca1541c61e51ba13bdded64c273c278e50850ae3bff073",
-      "label": "USDC/USDT (Cetus)"
     },
     {
       "method": "pool_reserves",
