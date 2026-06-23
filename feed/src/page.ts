@@ -49,7 +49,7 @@ export const LANDING_HTML = `<!doctype html>
   .tape:hover .run{animation-play-state:paused}
   @keyframes marq{from{transform:translateX(0)}to{transform:translateX(-50%)}}
   .tape .chip{margin:0 16px}.tape .chip b{color:var(--green);font-variant-numeric:tabular-nums}.tape .chip.dn b{color:var(--red)}
-  .hero{background:var(--surface);border:1px solid #333;border-radius:14px;padding:18px;margin:18px 0}
+  .hero{background:var(--surface);border:1px solid #333;border-radius:14px;padding:18px;margin:18px 0;position:relative}
   .hero .top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
   .hero h2{margin:0;font-size:1.05em}
   .hero .sub{color:var(--mut);font-size:.85em}
@@ -63,6 +63,9 @@ export const LANDING_HTML = `<!doctype html>
     background:linear-gradient(90deg,transparent,rgba(0,255,117,.07),transparent);animation:scanx 4.5s linear infinite}
   @keyframes scanx{0%{left:-140px}100%{left:100%}}
   .yl{position:absolute;left:6px;transform:translateY(-50%);font-size:.72em;color:var(--mut);font-variant-numeric:tabular-nums;pointer-events:none;background:rgba(16,16,16,.65);padding:0 4px;border-radius:3px;z-index:2}
+  .chartwrap svg{cursor:crosshair}
+  .tip{position:absolute;pointer-events:none;display:none;z-index:3;background:rgba(20,20,20,.96);border:1px solid var(--green);border-radius:7px;padding:5px 9px;font-size:.8em;white-space:nowrap;transform:translate(-50%,calc(-100% - 12px));box-shadow:0 4px 16px rgba(0,0,0,.5)}
+  .tip b{color:var(--green)}.tip .dn{color:var(--red)}.tip .sub{color:var(--mut);font-size:.85em}
   .xaxis{display:flex;justify-content:space-between;font-size:.72em;color:var(--mut);margin-top:5px;padding:0 2px}
   .cap{color:var(--mut);font-size:.83em;margin-top:8px;line-height:1.55}
   .cap b{color:var(--ink)}
@@ -140,6 +143,7 @@ export const LANDING_HTML = `<!doctype html>
       <span class="yl" id="y-zero">0%</span>
       <span class="yl" id="y-bot"></span>
     </div>
+    <div class="tip" id="tip"></div>
     <div class="xaxis"><span>◂ 90 seconds ago</span><span>now ▸</span></div>
     <div class="cap">Each line is one <b>live pool's liquidity</b>, as % change over the last 90 seconds (<b>0%</b> = where it stood 90s ago). <span class="up">Green climbs</span> as liquidity builds; <span class="down">red dives</span> as it drains — a line falling toward <b>−100%</b> is a pool being emptied, a rug as it happens.</div>
     <div class="legend" id="legend"></div>
@@ -194,7 +198,7 @@ function tweenStep(){for(const k in tweens){const t=tweens[k];t.cur=lerp(t.cur,t
 
 // ---- the multi-line live chart ----------------------------------------------
 const W=1000,H=340,PAD=14,WINDOW=90; // seconds shown
-const chartState={lines:[],maxT:0,perfAt:0,dom:{mn:-.05,mx:.1},featured:null,drains:new Set()};
+const chartState={lines:[],maxT:0,perfAt:0,dom:{mn:-.05,mx:.1},featured:null,drains:new Set(),hoverId:null,viewLeft:0};
 function setSeries(d){
   const drains=new Set((d.draining||[]).map(x=>x.id));
   let maxT=0;
@@ -210,6 +214,7 @@ function setSeries(d){
   chartState.featured=f?f.id:null;
 }
 function colorFor(l){
+  if(l.id===chartState.hoverId)return{stroke:l.draining?'#ff8a8a':'#9dffc6',w:3.4,op:1,glow:true};
   if(l.draining)return{stroke:'#ff5c5c',w:2.6,op:.95,glow:true};
   if(l.id===chartState.featured)return{stroke:'#00FF75',w:2.8,op:1,glow:true};
   const m=Math.min(.55,.22+Math.abs(l.changePct)*1.6);
@@ -224,6 +229,7 @@ function drawChart(){
   if(!lines.length){svg.innerHTML='<text x="500" y="170" fill="#6a6a6a" text-anchor="middle" font-size="15">waiting for the stream…</text>';setYLabels(0,0,0,false);return}
   const rightT=chartState.maxT+(performance.now()-chartState.perfAt)/1000;
   const left=rightT-WINDOW;
+  chartState.viewLeft=left; // so the hover handler can map cursor x -> time
   const x=t=>PAD+(t-left)/WINDOW*(W-2*PAD);
   // vertical domain from the currently visible points, eased toward target
   let mn=Infinity,mx=-Infinity;
@@ -241,7 +247,8 @@ function drawChart(){
   // zero baseline (where every line starts)
   if(dmn<0&&dmx>0){const y0=y(0).toFixed(1);g+='<line x1="'+PAD+'" x2="'+(W-PAD)+'" y1="'+y0+'" y2="'+y0+'" stroke="rgba(255,255,255,.14)" stroke-width="1" stroke-dasharray="4 5"/>';}
   // draw crowd first, highlights last (on top)
-  const order=lines.slice().sort((a,b)=>{const ra=(a.draining||a.id===chartState.featured)?1:0,rb=(b.draining||b.id===chartState.featured)?1:0;return ra-rb;});
+  const rank=l=>l.id===chartState.hoverId?2:(l.draining||l.id===chartState.featured)?1:0;
+  const order=lines.slice().sort((a,b)=>rank(a)-rank(b));
   for(const l of order){
     const vis=l.pts.filter(p=>p.t>=left-2&&p.t<=rightT+2);
     if(!vis.length)continue;
@@ -342,6 +349,31 @@ async function tick(){
   }catch(e){$('watching').textContent='reconnecting…'}
 }
 // one rAF loop drives the gliding chart + the counting numbers
+// hover a line -> name it (and highlight + click to open on DexPaprika)
+function lineValAt(l,t){let best=null,bd=1e9;for(const p of l.pts){const d=Math.abs(p.t-t);if(d<bd){bd=d;best=p;}}return best?best.v:null;}
+(function hover(){
+  const svg=$('chart');const hero=svg&&svg.closest('.hero');const tip=$('tip');
+  if(!svg||!hero||!tip)return;
+  svg.addEventListener('mousemove',e=>{
+    const r=svg.getBoundingClientRect();
+    const sx=(e.clientX-r.left)/r.width*W,sy=(e.clientY-r.top)/r.height*H;
+    const t=chartState.viewLeft+(sx-PAD)/(W-2*PAD)*WINDOW;
+    const dmn=chartState.dom.mn,dmx=chartState.dom.mx;
+    const yOf=v=>H-PAD-(v-dmn)/(dmx-dmn)*(H-2*PAD);
+    let best=null,bd=1e9;
+    for(const l of chartState.lines){const v=lineValAt(l,t);if(v==null)continue;const dy=Math.abs(yOf(v)-sy);if(dy<bd){bd=dy;best=l;}}
+    if(best&&bd<20){
+      chartState.hoverId=best.id;
+      const dn=best.draining||best.changePct<0;
+      tip.innerHTML='<b>'+esc(best.label)+'</b><br><span class="'+(dn?'dn':'')+'">'+pct(best.changePct)+'</span> <span class="sub">over 90s · click to open ↗</span>';
+      const h=hero.getBoundingClientRect();
+      tip.style.left=(e.clientX-h.left)+'px';tip.style.top=(e.clientY-h.top)+'px';
+      tip.style.display='block';svg.style.cursor='pointer';
+    }else{chartState.hoverId=null;tip.style.display='none';svg.style.cursor='crosshair';}
+  });
+  svg.addEventListener('mouseleave',()=>{chartState.hoverId=null;tip.style.display='none';});
+  svg.addEventListener('click',()=>{const id=chartState.hoverId;if(!id)return;const l=chartState.lines.find(x=>x.id===id);if(l&&l.id)window.open(dp(l.chain,l.id),'_blank','noopener');});
+})();
 function frame(){drawChart();tweenStep();requestAnimationFrame(frame)}
 requestAnimationFrame(frame);
 tick();setInterval(tick,1000);
