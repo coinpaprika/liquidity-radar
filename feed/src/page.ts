@@ -70,6 +70,8 @@ export const LANDING_HTML = `<!doctype html>
   .legend .lg{display:flex;align-items:center;gap:6px}
   a.lg{color:inherit;text-decoration:none}
   a.lg:hover{color:var(--green)}
+  .more{cursor:pointer;color:var(--green);white-space:nowrap;font-weight:600;user-select:none}
+  .more:hover{text-decoration:underline}
   .legend .sw{width:14px;height:3px;border-radius:2px;display:inline-block}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:18px}
   .disc{color:var(--mut);font-size:.78em;margin-top:8px}
@@ -284,6 +286,26 @@ const rowRise=r=>row(r,esc(r.label),pct(r.changePct),'up',cell(r)+'<span class="
 const rowRug=r=>row(r,esc(r.label),pct(r.changePct)+usd(r.reserveUsd),'up',cell(r)+'<span class="val up">'+pct(r.changePct)+' · '+usd(r.reserveUsd)+'</span>');
 const rowDrain=r=>row(r,esc(r.label)+esc(r.block),usd(r.deltaUsd),'dn',cell(r)+'<span class="val down">'+usd(r.deltaUsd)+' ('+pct(r.pct)+')</span>');
 
+const chip=(l,color)=>{const inner='<span class="sw" style="background:'+color+'"></span>'+esc(l.label)+' '+pct(l.changePct);return l.id?'<a class="lg" href="'+dp(l.chain,l.id)+'" target="_blank" rel="noopener" title="Open '+esc(l.label)+' on DexPaprika">'+inner+'</a>':'<span class="lg">'+inner+'</span>';};
+let legendExpanded=false;
+function toggleLegend(){legendExpanded=!legendExpanded;renderLegend();}
+function renderLegend(){
+  const lines=chartState.lines;
+  const f=lines.find(l=>l.id===chartState.featured);
+  const draining=lines.filter(l=>l.draining);
+  const shown=new Set();
+  let lg='';
+  if(f){lg+=chip(f,'#00FF75');shown.add(f.id);}
+  draining.slice(0,3).forEach(l=>{if(!shown.has(l.id)){lg+=chip(l,'#ff5c5c');shown.add(l.id);}});
+  const rest=lines.filter(l=>!shown.has(l.id));
+  if(legendExpanded){
+    rest.forEach(l=>lg+=chip(l,l.draining?'#ff5c5c':'rgba(0,255,117,.55)'));
+    if(rest.length)lg+='<span class="more" onclick="toggleLegend()">show less ▴</span>';
+  }else if(rest.length){
+    lg+='<span class="more" onclick="toggleLegend()">+'+rest.length+' more ▾</span>';
+  }
+  $('legend').innerHTML=lg;
+}
 function legendAndSub(d){
   const lines=chartState.lines;
   const draining=lines.filter(l=>l.draining);
@@ -292,12 +314,7 @@ function legendAndSub(d){
   $('hero-sub').innerHTML=lines.length
     ?'normalized to % change over the last '+WINDOW+'s · '+(f?'top <span class="chg up">'+pct(f.changePct)+'</span> '+esc(f.label):'')+(draining.length?' · <span class="chg down">'+draining.length+' draining</span>':'')
     :'';
-  const chip=(l,color)=>{const inner='<span class="sw" style="background:'+color+'"></span>'+esc(l.label)+' '+pct(l.changePct);return l.id?'<a class="lg" href="'+dp(l.chain,l.id)+'" target="_blank" rel="noopener" title="Open '+esc(l.label)+' on DexPaprika">'+inner+'</a>':'<span class="lg">'+inner+'</span>';};
-  let lg='';
-  if(f)lg+=chip(f,'#00FF75');
-  draining.slice(0,3).forEach(l=>lg+=chip(l,'#ff5c5c'));
-  if(lines.length>(f?1:0)+Math.min(draining.length,3))lg+='<span class="lg"><span class="sw" style="background:rgba(0,255,117,.4)"></span>+'+(lines.length-(f?1:0)-Math.min(draining.length,3))+' more</span>';
-  $('legend').innerHTML=lg;
+  renderLegend();
 }
 function buildTape(d){
   const parts=[];
