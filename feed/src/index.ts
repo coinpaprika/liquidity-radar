@@ -761,10 +761,10 @@ export class RadarDO {
     // rising / rug-watch come from the scanner (thousands of pools)
     let risers = this.rankRisers();
     if (!risers.length) risers = (await this.state.storage.get<Riser[]>("scan_rising")) ?? [];
-    const rising = risers.slice(0, 12).map((r) => ({ label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
+    const rising = risers.slice(0, 12).map((r) => ({ id: r.id, label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
     let rugList = risers.filter((r) => r.liqUsd <= RUG_MAX_TVL);
     if (!rugList.length) rugList = (await this.state.storage.get<Riser[]>("scan_rugwatch")) ?? [];
-    const rugWatch = rugList.slice(0, 8).map((r) => ({ label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
+    const rugWatch = rugList.slice(0, 8).map((r) => ({ id: r.id, label: r.label, chain: r.chain, changePct: r.growthPct, reserveUsd: r.liqUsd }));
 
     // hero chart: the fastest-rising pool we're actually streaming (real-time series)
     let hero: { label: string; chain: string; changePct: number; series: { t: number; r: number }[] } | null = null;

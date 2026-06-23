@@ -64,12 +64,18 @@ export const LANDING_HTML = `<!doctype html>
   @keyframes scanx{0%{left:-140px}100%{left:100%}}
   .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:.82em;color:var(--mut)}
   .legend .lg{display:flex;align-items:center;gap:6px}
+  a.lg{color:inherit;text-decoration:none}
+  a.lg:hover{color:var(--green)}
   .legend .sw{width:14px;height:3px;border-radius:2px;display:inline-block}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:18px}
   .disc{color:var(--mut);font-size:.78em;margin-top:8px}
   .card{background:var(--surface);border:1px solid #333;border-radius:14px;padding:14px}
   .card h3{margin:0 0 10px;font-size:.95em;display:flex;align-items:center;gap:8px}
   .row{display:flex;align-items:baseline;gap:8px;padding:7px 6px;margin:0 -6px;border-bottom:1px solid #2f2f2f;font-size:.92em;border-radius:6px}
+  a.row{color:inherit;text-decoration:none;cursor:pointer}
+  a.row:hover{background:rgba(0,255,117,.07)}
+  a.row::after{content:"↗";margin-left:6px;color:var(--mut);opacity:.35;font-size:.85em;align-self:center}
+  a.row:hover::after{opacity:.9;color:var(--green)}
   .row:last-child{border-bottom:none}
   .row .name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .row .chain{color:var(--mut);font-size:.82em}
@@ -251,9 +257,18 @@ function renderList(elId,items,rowFn){
   });
   prevVals[elId]=nv;
 }
-const rowRise=r=>'<div class="row" data-k="'+esc(r.label)+'" data-v="'+pct(r.changePct)+'" data-dir="up"><span class="name">'+esc(r.label)+'</span><span class="chain">'+esc(r.chain)+'</span><span class="val up">'+pct(r.changePct)+'</span></div>';
-const rowRug=r=>'<div class="row" data-k="'+esc(r.label)+'" data-v="'+pct(r.changePct)+usd(r.reserveUsd)+'" data-dir="up"><span class="name">'+esc(r.label)+'</span><span class="chain">'+esc(r.chain)+'</span><span class="val up">'+pct(r.changePct)+' · '+usd(r.reserveUsd)+'</span></div>';
-const rowDrain=r=>'<div class="row" data-k="'+esc(r.label)+esc(r.block)+'" data-v="'+usd(r.deltaUsd)+'" data-dir="dn"><span class="name">'+esc(r.label)+'</span><span class="chain">'+esc(r.chain)+'</span><span class="val down">'+usd(r.deltaUsd)+' ('+pct(r.pct)+')</span></div>';
+// full pool chart + detail on DexPaprika
+const dp=(chain,id)=>'https://dexpaprika.com/'+encodeURIComponent(chain)+'/pool/'+encodeURIComponent(id);
+// a row is an <a> linking to DexPaprika when we have the pool id, else a plain <div>
+function row(r,key,val,dir,body){
+  const link=r.id?' href="'+dp(r.chain,r.id)+'" target="_blank" rel="noopener" title="Open '+esc(r.label)+' on DexPaprika"':'';
+  const tag=r.id?'a':'div';
+  return '<'+tag+' class="row" data-k="'+key+'" data-v="'+val+'" data-dir="'+dir+'"'+link+'>'+body+'</'+tag+'>';
+}
+const cell=r=>'<span class="name">'+esc(r.label)+'</span><span class="chain">'+esc(r.chain)+'</span>';
+const rowRise=r=>row(r,esc(r.label),pct(r.changePct),'up',cell(r)+'<span class="val up">'+pct(r.changePct)+'</span>');
+const rowRug=r=>row(r,esc(r.label),pct(r.changePct)+usd(r.reserveUsd),'up',cell(r)+'<span class="val up">'+pct(r.changePct)+' · '+usd(r.reserveUsd)+'</span>');
+const rowDrain=r=>row(r,esc(r.label)+esc(r.block),usd(r.deltaUsd),'dn',cell(r)+'<span class="val down">'+usd(r.deltaUsd)+' ('+pct(r.pct)+')</span>');
 
 function legendAndSub(d){
   const lines=chartState.lines;
@@ -263,9 +278,10 @@ function legendAndSub(d){
   $('hero-sub').innerHTML=lines.length
     ?'normalized to % change over the last '+WINDOW+'s · '+(f?'top <span class="chg up">'+pct(f.changePct)+'</span> '+esc(f.label):'')+(draining.length?' · <span class="chg down">'+draining.length+' draining</span>':'')
     :'';
+  const chip=(l,color)=>{const inner='<span class="sw" style="background:'+color+'"></span>'+esc(l.label)+' '+pct(l.changePct);return l.id?'<a class="lg" href="'+dp(l.chain,l.id)+'" target="_blank" rel="noopener" title="Open '+esc(l.label)+' on DexPaprika">'+inner+'</a>':'<span class="lg">'+inner+'</span>';};
   let lg='';
-  if(f)lg+='<span class="lg"><span class="sw" style="background:#00FF75"></span>'+esc(f.label)+' '+pct(f.changePct)+'</span>';
-  draining.slice(0,3).forEach(l=>lg+='<span class="lg"><span class="sw" style="background:#ff5c5c"></span>'+esc(l.label)+' '+pct(l.changePct)+'</span>');
+  if(f)lg+=chip(f,'#00FF75');
+  draining.slice(0,3).forEach(l=>lg+=chip(l,'#ff5c5c'));
   if(lines.length>(f?1:0)+Math.min(draining.length,3))lg+='<span class="lg"><span class="sw" style="background:rgba(0,255,117,.4)"></span>+'+(lines.length-(f?1:0)-Math.min(draining.length,3))+' more</span>';
   $('legend').innerHTML=lg;
 }
