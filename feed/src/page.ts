@@ -168,6 +168,22 @@ export const LANDING_HTML = `<!doctype html>
 
   <div class="stats" id="stats"></div>
 
+  <section class="hyp" aria-label="How LiquidityRadar gets its data">
+    <h3><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="#00ff88"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg> Built on free, public DexPaprika data</h3>
+    <div class="q">No private endpoints, no special access, no API key. Everything you see here runs on the same public data any developer can call today, from two free, keyless DexPaprika endpoints.</div>
+    <div class="nums" style="font-style:normal">
+      <span>
+        <code style="font-family:var(--mono);color:var(--green);font-size:.95em">POST streaming.dexpaprika.com/sse/reserves</code>
+        <span style="color:var(--mut);font-size:.86em">Live reserves over one SSE connection, multiplexing every pool on the chart, so a drain shows up the block it happens. This is what turns into the red and green lines above.</span>
+      </span>
+      <span>
+        <code style="font-family:var(--mono);color:var(--green);font-size:.95em">GET /networks/{chain}/pools/filter</code>
+        <span style="color:var(--mut);font-size:.86em">REST pool discovery, so you pick which pools are worth watching before subscribing to their reserves.</span>
+      </span>
+    </div>
+    <div class="q" style="margin-top:12px">That's the whole stack: those two calls plus one Cloudflare Worker and a Durable Object you deploy with a single command. Don't take our word for it. Call the endpoints, diff the numbers, then <a href="https://github.com/coinpaprika/liquidity-radar" target="_blank" rel="noopener">fork the repo</a> or read <a href="https://docs.dexpaprika.com" target="_blank" rel="noopener">the docs</a>. If this is what the free data does, picture what you'd build on top of it.</div>
+  </section>
+
   <div class="cta">
     <a class="btn" href="https://x.com/LiquidityRadar">Follow on X</a>
     <a class="btn alt" href="https://github.com/coinpaprika/liquidity-radar">Fork on GitHub</a>
