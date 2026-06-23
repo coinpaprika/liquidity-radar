@@ -62,7 +62,11 @@ export const LANDING_HTML = `<!doctype html>
   .scanx{position:absolute;top:0;bottom:0;width:140px;pointer-events:none;
     background:linear-gradient(90deg,transparent,rgba(0,255,117,.07),transparent);animation:scanx 4.5s linear infinite}
   @keyframes scanx{0%{left:-140px}100%{left:100%}}
-  .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:.82em;color:var(--mut)}
+  .yl{position:absolute;left:6px;transform:translateY(-50%);font-size:.72em;color:var(--mut);font-variant-numeric:tabular-nums;pointer-events:none;background:rgba(16,16,16,.65);padding:0 4px;border-radius:3px;z-index:2}
+  .xaxis{display:flex;justify-content:space-between;font-size:.72em;color:var(--mut);margin-top:5px;padding:0 2px}
+  .cap{color:var(--mut);font-size:.83em;margin-top:8px;line-height:1.55}
+  .cap b{color:var(--ink)}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:12px;font-size:.82em;color:var(--mut)}
   .legend .lg{display:flex;align-items:center;gap:6px}
   a.lg{color:inherit;text-decoration:none}
   a.lg:hover{color:var(--green)}
@@ -130,7 +134,12 @@ export const LANDING_HTML = `<!doctype html>
       <div class="gridbg"></div>
       <svg id="chart" viewBox="0 0 1000 340" preserveAspectRatio="none"></svg>
       <div class="scanx"></div>
+      <span class="yl" id="y-top"></span>
+      <span class="yl" id="y-zero">0%</span>
+      <span class="yl" id="y-bot"></span>
     </div>
+    <div class="xaxis"><span>◂ 90 seconds ago</span><span>now ▸</span></div>
+    <div class="cap">Each line is one <b>live pool's liquidity</b>, as % change over the last 90 seconds (<b>0%</b> = where it stood 90s ago). <span class="up">Green climbs</span> as liquidity builds; <span class="down">red dives</span> as it drains — a line falling toward <b>−100%</b> is a pool being emptied, a rug as it happens.</div>
     <div class="legend" id="legend"></div>
   </section>
 
@@ -204,10 +213,13 @@ function colorFor(l){
   const m=Math.min(.55,.22+Math.abs(l.changePct)*1.6);
   return{stroke:'rgba(0,255,117,'+m.toFixed(2)+')',w:1.3,op:1,glow:false};
 }
+function setYLabels(yt,yz,yb,show){for(const e of [$('y-top'),$('y-zero'),$('y-bot')])if(e)e.style.display=show?'':'none';
+  if(show){$('y-top').textContent=yt.t;$('y-top').style.top=yt.y+'px';$('y-bot').textContent=yb.t;$('y-bot').style.top=yb.y+'px';
+    if(yz){$('y-zero').style.display='';$('y-zero').style.top=yz+'px';}else $('y-zero').style.display='none';}}
 function drawChart(){
   const svg=$('chart');if(!svg)return;
   const lines=chartState.lines;
-  if(!lines.length){svg.innerHTML='<text x="500" y="170" fill="#6a6a6a" text-anchor="middle" font-size="15">waiting for the stream…</text>';return}
+  if(!lines.length){svg.innerHTML='<text x="500" y="170" fill="#6a6a6a" text-anchor="middle" font-size="15">waiting for the stream…</text>';setYLabels(0,0,0,false);return}
   const rightT=chartState.maxT+(performance.now()-chartState.perfAt)/1000;
   const left=rightT-WINDOW;
   const x=t=>PAD+(t-left)/WINDOW*(W-2*PAD);
@@ -220,6 +232,8 @@ function drawChart(){
   chartState.dom.mn=lerp(chartState.dom.mn,tmn,.12);chartState.dom.mx=lerp(chartState.dom.mx,tmx,.12);
   const dmn=chartState.dom.mn,dmx=chartState.dom.mx;
   const y=v=>H-PAD-(v-dmn)/(dmx-dmn)*(H-2*PAD);
+  // y-axis scale labels (HTML overlay; SVG text would stretch)
+  setYLabels({t:pct(dmx),y:y(dmx)},(dmn<-0.001&&dmx>0.001)?y(0):null,{t:pct(dmn),y:y(dmn)},true);
   const pulse=3.2+1.6*Math.sin(performance.now()/260);
   let g='<defs><filter id="glow" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2.4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
   // zero baseline (where every line starts)
