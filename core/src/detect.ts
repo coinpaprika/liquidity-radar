@@ -38,7 +38,7 @@ function isQuote(tokenId: string): boolean {
 /**
  * Value a pool by its quote leg(s): the real USD on the SOL/USDC/USDT side,
  * not the meme leg's inflated notional. `quoted` is false when neither leg is a
- * known quote token (meme/meme pair) — then we fall back to the pool total,
+ * known quote token (meme/meme pair); then we fall back to the pool total,
  * which can't be trusted, so callers may choose to ignore it. `nonQuoteRose`
  * flags that a non-quote leg increased, which (with the quote leg falling) means
  * a sell-swap, not a liquidity removal.
@@ -79,7 +79,7 @@ export function poolReserveUsd(event: PoolReserveEvent): number {
  * Pools are valued by their quote leg (SOL/USDC/USDT), so the USD figures are
  * the real money, not a meme token's inflated notional. A drain is a liquidity
  * removal: the quote leg falls AND no non-quote leg rises (a sell-swap pulls
- * the quote leg down too, but pushes the meme leg up — that is not a drain).
+ * the quote leg down too, but pushes the meme leg up, which is not a drain).
  */
 export function detect(
   event: ReserveEvent,

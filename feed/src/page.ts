@@ -11,16 +11,16 @@ export const LANDING_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LiquidityRadar — watch DEX liquidity build and rug, live</title>
+<title>LiquidityRadar: watch DEX liquidity build and rug, live</title>
 <meta name="description" content="Real-time DEX liquidity, live. Dozens of pools streamed at once: watch liquidity climb and get drained the block it happens, on the free DexPaprika reserve stream.">
 <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAAsTAAALEwEAmpwYAAADPklEQVRYhb2XbUhTURjHT0lGorlejEnMyrfUbR8kV0nQO1YYWU4lX0pQWISIafohIcRIEZ26SdtEJ6Ny+6ASWIxZyFCaCRH2oW8rKZkiu4MQoiV6tyeeCw2beq9zuzvwfLnnnvP/nee8/glZUwwGQ9XU1NSc0+mkwa/09fVBSnLKlsNut/va0jQN2KfNZvvR39uvIP5FrVbvHh8f/+L1emFhYQEGBwdB2aGEjvYOX5SVlgUE0Pio0ddWqVSCyWSCxcVFQI0xy9jnpqamSB8Ains8Huju6ob0tPSAhAKJjPQM0Gg0DITZbJ5hxAcGBqowTSjOl7B/6LQ6wAFrn2kryPSH6TlMO58j9w+JWAIURcHExMQsoSiKxjkPVeeH72RDtKUE9nyqhESZeNP/hoeHYd4xv0pwheJCCRVA3NOrkJglhgNduRD35Mqm/6lVanC73UBw/tva2kKe5lhTAcS1XNu0vrOzE1ZWVkILkHAjCw49zgHBczkQbwMIa86HB0D44AJEuKqBQMN/Iay/xA2wtLQEzc3N2xZPkqbBzl+168Qx8PvRy5kbtmttaQWXywUk2LQLH17cUPxf4HSwtSfBAkTZylkBot+V8Qdw7IwUCF3PChDzupg/gIPtuaziGPt68/gDiLTf4wRg24pBASTclHGK7/hTB0knxDwApKZCtLmEE0DwsoCzLxKo+JGcTOai4RKPoKqZOyEoAMELOUT8rGFuN4EhH6Lel3OueuYA+l0LosJTWxoQYavcr83jFNto5CL5yS1nlLBVJkvSINZYAMTDPWrm0HlbConZ0oCmlOBbQJ7PflwmXM+Cva9uw0533fp0u+sg5k0xiIpOByRcVFjEXIIkkNsw+XgqiG7JIP7+WYivOgeifBlzGW1nJ/HyHkjZDgBN04wHCDeA70nmdDppo9EYdoCRkRFwOByrxGazfUfHIs7gPjRCFVKJlHmMWK3Wr0Sv11egU0HHEi4Afb+eMSYqlaqccUfo1RACHQuaBj5HjuJYRkdHP/q8IRpFi8Uyg1ToWIaGhkDVrQqZOcW+cM4x7aiB4gqFYtc6l6zT6ConJydn0bHg7giVPV9eXmZckNVq/dbT03N3reZfR9UdchH9px8AAAAASUVORK5CYII=">
 <meta name="theme-color" content="#00FF75">
 <meta property="og:type" content="website">
-<meta property="og:title" content="LiquidityRadar — DEX liquidity, live">
+<meta property="og:title" content="LiquidityRadar: DEX liquidity, live">
 <meta property="og:description" content="Dozens of pools streamed at once. Watch liquidity climb and get drained the block it happens, on DexPaprika's free reserve stream.">
 <meta property="og:image" content="https://docs.dexpaprika.com/images/brand/dexpaprika-banner-1200x675.png">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="LiquidityRadar — DEX liquidity, live">
+<meta name="twitter:title" content="LiquidityRadar: DEX liquidity, live">
 <meta name="twitter:description" content="Watch DEX liquidity build and rug, live. Powered by DexPaprika.">
 <meta name="twitter:image" content="https://docs.dexpaprika.com/images/brand/dexpaprika-banner-1200x675.png">
 <style>
@@ -80,6 +80,7 @@ export const LANDING_HTML = `<!doctype html>
   .disc{color:var(--mut);font-size:.78em;margin-top:8px}
   .card{background:var(--surface);border:1px solid #333;border-radius:14px;padding:14px}
   .card h3{margin:0 0 10px;font-size:.95em;display:flex;align-items:center;gap:8px}
+  .ic{width:1.15em;height:1.15em;flex-shrink:0;display:inline-block;vertical-align:-.2em}
   .row{display:flex;align-items:baseline;gap:8px;padding:7px 6px;margin:0 -6px;border-bottom:1px solid #2f2f2f;font-size:.92em;border-radius:6px}
   a.row{color:inherit;text-decoration:none;cursor:pointer}
   a.row:hover{background:rgba(0,255,117,.07)}
@@ -92,7 +93,7 @@ export const LANDING_HTML = `<!doctype html>
   .stats{display:flex;gap:18px;flex-wrap:wrap;color:var(--mut);font-size:.85em;margin:16px 2px}
   .stats b{color:var(--ink);font-variant-numeric:tabular-nums}
   .hyp{background:var(--surface);border:1px solid #333;border-left:4px solid var(--green);border-radius:14px;padding:14px 16px;margin:18px 0}
-  .hyp h3{margin:0 0 4px;font-size:.95em}
+  .hyp h3{margin:0 0 4px;font-size:.95em;display:flex;align-items:center;gap:8px}
   .hyp .q{color:var(--mut);font-size:.82em;font-style:italic}
   .hyp .nums{display:flex;gap:22px;flex-wrap:wrap;margin-top:10px;font-size:.9em}
   .hyp .nums b{color:var(--green);font-size:1.25em;font-variant-numeric:tabular-nums}
@@ -145,20 +146,20 @@ export const LANDING_HTML = `<!doctype html>
     </div>
     <div class="tip" id="tip"></div>
     <div class="xaxis"><span>◂ 90 seconds ago</span><span>now ▸</span></div>
-    <div class="cap">Each line is one <b>live pool's liquidity</b>, as % change over the last 90 seconds (<b>0%</b> = where it stood 90s ago). <span class="up">Green climbs</span> as liquidity builds; <span class="down">red dives</span> as it drains — a line falling toward <b>−100%</b> is a pool being emptied, a rug as it happens.</div>
+    <div class="cap">Each line is one <b>live pool's liquidity</b>, as % change over the last 90 seconds (<b>0%</b> = where it stood 90s ago). <span class="up">Green climbs</span> as liquidity builds; <span class="down">red dives</span> as it drains. A line falling toward <b>−100%</b> means a pool is being emptied: a rug, as it happens.</div>
     <div class="legend" id="legend"></div>
   </section>
 
   <div class="grid">
-    <div class="card"><h3>🟢 Fastest-rising liquidity</h3><div id="rising"><div class="empty">…</div></div>
+    <div class="card"><h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#00FF75" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11l4-4 3 2.5 5-5"/><path d="M14 4.5h-3.3M14 4.5v3.3"/></svg> Fastest-rising liquidity</h3><div id="rising"><div class="empty">…</div></div>
       <div class="disc">Pools whose liquidity is climbing fastest right now, scanned across thousands of pairs.</div></div>
-    <div class="card"><h3>🚩 Rug watch</h3><div id="rugwatch"><div class="empty">…</div></div>
+    <div class="card"><h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#ffb02e" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.6l6.2 10.8H1.8z"/><path d="M8 6.6v3"/><path d="M8 11.4h.01"/></svg> Rug watch</h3><div id="rugwatch"><div class="empty">…</div></div>
       <div class="disc">Small, recently-created pools building liquidity unusually fast: the classic pre-rug profile. High-risk, not a guarantee, not financial advice.</div></div>
-    <div class="card"><h3>🚨 Just drained</h3><div id="draining"><div class="empty">…</div></div></div>
+    <div class="card"><h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#ff5c5c" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v9"/><path d="M4 7.5l4 4 4-4"/></svg> Just drained</h3><div id="draining"><div class="empty">…</div></div></div>
   </div>
 
   <div class="hyp">
-    <h3>📡 The experiment, live</h3>
+    <h3><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#00FF75" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.4" opacity=".55"/><path d="M8 8l4.3-2.7"/></svg> The experiment, live</h3>
     <div class="q">Hypothesis: pools whose liquidity rises fastest are the ones that drain. We log every pool that enters the rug-watch profile, then count how many actually drain.</div>
     <div class="nums" id="hyp"><span class="empty">gathering data…</span></div>
   </div>
@@ -326,7 +327,8 @@ function legendAndSub(d){
 function buildTape(d){
   const parts=[];
   (d.rising||[]).slice(0,8).forEach(r=>parts.push('<span class="chip">'+esc(r.label)+' <b>'+pct(r.changePct)+'</b></span>'));
-  (d.draining||[]).slice(0,6).forEach(r=>parts.push('<span class="chip dn">🚨 '+esc(r.label)+' <b>'+usd(r.deltaUsd)+'</b></span>'));
+  const icDr='<svg class="ic" viewBox="0 0 16 16" fill="none" stroke="#ff5c5c" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v9"/><path d="M4 7.5l4 4 4-4"/></svg> ';
+  (d.draining||[]).slice(0,6).forEach(r=>parts.push('<span class="chip dn">'+icDr+esc(r.label)+' <b>'+usd(r.deltaUsd)+'</b></span>'));
   const one=parts.length?parts.join(''):'<span class="chip">scanning the chains…</span>';
   $('tape').innerHTML=one+one; // duplicated for a seamless loop
 }
