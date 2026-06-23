@@ -102,9 +102,14 @@ const DEFAULT_STREAM_MAX_AGE_S = 600; // proactively recycle connections this of
 // (dynamic vaults route reserves to lending, so total_reserve_usd swings, and it
 // disagrees with REST liquidity_usd by 10-50x). Excluded from scanner + stream.
 const SKIP_DEX = /manifest|daam/i;
+// Recognized stablecoins (symbols, compared uppercased). A pair of two of these
+// is not a rug candidate and is dropped from the watchlist: its quote leg swings
+// hard on normal swaps/rebalances (worse when the pool is thin), which a
+// single-leg valuation would misread as a drain.
 const STABLES = new Set([
   "USDC", "USDT", "USDG", "PYUSD", "USDS", "DAI", "USDE", "USDM", "FDUSD",
   "TUSD", "USD₮0", "USDT0", "USD₮", "BUSD", "FRAX", "GUSD", "LUSD", "USDD", "USDC.E",
+  "MUSD", "GHO", "CRVUSD", "USDP", "SUSDE", "SUSDS", "USD0", "USR", "DOLA", "MIM", "USDX", "USDL",
 ]);
 
 function envInt(v: string | undefined, fallback: number): number {

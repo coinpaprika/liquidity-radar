@@ -186,3 +186,22 @@ test("meme/meme pool with no quote leg falls back to the pool total", () => {
   assert.ok(a);
   assert.equal(a.deltaUsd, -100_000);
 });
+
+// USDC/mUSD (two stablecoins): with both legs recognized as quote, a swap that
+// drains the USDC leg but fills the mUSD leg nets ~0 and is NOT a drain.
+const MUSD = "0xaca92e438df0b2401ff60da7e4337b687a2435da";
+test("a stable/stable swap (USDC out, mUSD in) is not a drain", () => {
+  const a = detect(
+    poolEvent({
+      chain: "ethereum",
+      total_reserve_usd: 3_900_000,
+      total_delta_usd: -200,
+      tokens: [
+        leg("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 712_000, -400_000), // USDC leg drops hard
+        leg(MUSD, 3_175_000, 399_800), // mUSD leg fills (swap)
+      ],
+    }),
+    { minUsd: 10_000, pctThreshold: 0.1 },
+  );
+  assert.equal(a, null); // both quote legs net ~0 -> not a drain
+});
