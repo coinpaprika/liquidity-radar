@@ -23,7 +23,7 @@
     "start": "node dist/cli/src/index.js",
     "dev:feed": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --import tsx --test core/test/sse.test.ts core/test/detect.test.ts core/test/config.test.ts core/test/coerce.test.ts core/test/webhook.test.ts",
+    "test": "node --import tsx --test core/test/sse.test.ts core/test/detect.test.ts core/test/config.test.ts core/test/coerce.test.ts core/test/webhook.test.ts core/test/score.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p feed/tsconfig.json"
   },
   "keywords": [

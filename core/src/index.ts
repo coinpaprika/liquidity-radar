@@ -22,6 +22,7 @@ export {
   type SubscribeOptions,
 } from "./stream.js";
 export { detect, DEFAULT_DETECT, poolQuoteUsd, poolReserveUsd, QUOTE_TOKENS, type DetectConfig } from "./detect.js";
+export { rugScore, type RugScoreFeatures } from "./score.js";
 export { DATA_CREDIT, formatAlert, usd, pct, shortAddr } from "./format.js";
 export { validateRadarConfig } from "./config.js";
 
