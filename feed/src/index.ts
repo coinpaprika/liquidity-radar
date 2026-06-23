@@ -24,6 +24,8 @@ import {
   createRadar,
   formatAlert,
   poolReserveUsd,
+  rugScore,
+  QUOTE_TOKENS,
   validateRadarConfig,
   type Alert,
   type Radar,
@@ -46,6 +48,7 @@ export interface Env extends SinkEnv {
   POOLS_PER_CHAIN?: string; // cold-start volume watchlist size per chain (default 37)
   SCAN_PAGES?: string; // pools/filter pages scanned per chain each cycle (default 6 = 600 pools/chain)
   SCAN_INTERVAL_SECONDS?: string; // liquidity scan cadence (default 60; liquidity_usd refreshes ~20-30s)
+  ENRICH_POOLS?: string; // key-gated: top-N candidates to deep-probe via getPoolDetails (default 24, 0 = off)
   DEXPAPRIKA_API_KEY?: string; // optional Pro/Enterprise key: lifts the stream cap 3->7 connections
   STREAM_MAX_AGE_SECONDS?: string; // proactively recycle the subscription this often (default 600)
   STREAM_KEYLESS?: string; // "1": don't send the key on the STREAM (scanner still keyed). For Cloudflare
@@ -91,6 +94,14 @@ const SCAN_AGE_DAYS = 7; // recently created = rug-prone
 const CAND_CAP = 3000; // discovered candidate pools held in memory (bound)
 const RUG_MAX_TVL = 750_000; // high-risk subset: small pool (rug-watch + hypothesis)
 const STREAM_REFRESH_MS = 5 * 60 * 1000; // rotate/re-point the stream at most this often
+// Candidate enrichment (key-gated booster, runs on the scan cadence): deep-probe
+// the top rug-scored candidates via getPoolDetails to add short-window sell-skew
+// (sharpens selection) and a per-swap-fresh quote reserve (promotes movers to the
+// stream). Free tier ranks on the pools/filter score alone; no detail calls.
+const ENRICH_TOP_N = 24; // top candidates to deep-probe each scan cycle
+const ENRICH_CONCURRENCY = 3; // bounded: stay under the Workers/stream outbound-connection ceiling
+const PROMOTE_MOVE_PCT = 0.15; // quote-reserve move between probes that promotes a pool to the stream
+const PROMOTE_TTL_MS = 4 * 60 * 1000; // a REST-promoted pin lasts this long (until the stream takes over)
 // "Rising" is read from the live stream's real quote-valued reserves, not REST.
 // A pool counts as rising when its reserve climbs >= this over the look-back.
 const STREAM_RISE_WINDOW_S = 600; // 10 min of streamed history defines the trend
@@ -156,12 +167,19 @@ interface Gate {
 // hypothesis buckets, keyed by subject (pool id), naturally deduped
 type HypMark = { label: string; chain: string; t: number; pct: number };
 // a discovered candidate pool (latest snapshot; the scanner overwrites each cycle).
-// volUsd (24h turnover) is the ranking key; liqUsd is kept for context only.
+// score (rug-risk prior) is the ranking key; the raw fields feed it.
 interface Candidate {
   label: string;
   chain: string;
   liqUsd: number;
   volUsd: number;
+  ageHours: number;
+  txns: number;
+  fdv: number; // risky (non-quote) token FDV; 0 = unknown
+  score: number; // composite rug-risk prior (rugScore)
+  // enrichment, set only when the candidate is deep-probed via getPoolDetails:
+  reserveUsd?: number; // quote-valued reserve (per-swap fresh), for mover promotion
+  priceTime?: number; // last-swap epoch seconds (freshness guard for promotion)
   t: number;
 }
 // a riser surfaced to the page (computed from the live stream's real reserves)
@@ -247,6 +265,8 @@ export class RadarDO {
   private candidates = new Map<string, Candidate>(); // discovered pools (rotation universe)
   private rotateCursor = 0; // advances each repoint so rotation sweeps the universe
   private activeAddrs = new Set<string>(); // addresses the current radar is subscribed to
+  private promoted = new Map<string, { chain: string; label: string; t: number }>(); // REST-detected movers pinned to the stream
+  private lastEnrich = ""; // last enrichment summary, for /status
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -293,6 +313,7 @@ export class RadarDO {
     const scanMs = envInt(this.env.SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_S) * 1000;
     if (Date.now() - this.lastScanMs > scanMs) {
       await this.scanCandidates();
+      await this.enrichTopCandidates(); // key-gated: sharpen top scores + promote REST-detected movers
       await this.maybeRepointStream();
       await this.ensureRunning(); // if the re-point stopped the radar, restart it now (no 30s gap)
     }
@@ -490,6 +511,26 @@ export class RadarDO {
     const syms = (p.tokens ?? []).map((t: any) => t.symbol ?? "?").slice(0, 2);
     return { syms, dex, label: `${syms.join("/")} (${dex})` };
   }
+  private ageHours(createdAt: unknown): number {
+    const ms = Date.parse(String(createdAt ?? ""));
+    return Number.isFinite(ms) ? Math.max(0, (Date.now() - ms) / 3_600_000) : NaN;
+  }
+  // FDV of the risky (non-quote) leg. The quote token (USDC/SOL/...) has a huge,
+  // irrelevant FDV, so pick the non-quote token; fall back to max if both/neither.
+  private riskyFdv(p: any): number {
+    const toks = (p.tokens ?? []) as any[];
+    const risky = toks.filter((t) => {
+      const id = String(t.id ?? "");
+      return !(QUOTE_TOKENS.has(id) || QUOTE_TOKENS.has(id.toLowerCase()));
+    });
+    const pick = risky.length ? risky : toks;
+    let fdv = 0;
+    for (const t of pick) {
+      const v = Number(t.fdv);
+      if (Number.isFinite(v) && v > fdv) fdv = v;
+    }
+    return fdv;
+  }
 
   // --- tier 1: candidate discovery ------------------------------------------
   // Page through each chain's small + recently-created pools and record the
@@ -564,11 +605,23 @@ export class RadarDO {
             const { syms, dex, label } = this.poolLabel(p);
             if (SKIP_DEX.test(dex)) continue;
             if (this.isStablePair(syms)) continue;
+            const volUsd = Number.isFinite(vol) ? vol : 0;
+            const ageHours = this.ageHours(p.created_at);
+            const txns = Number(p.transactions) || 0;
+            const fdv = this.riskyFdv(p);
+            const prev = this.candidates.get(id);
             this.candidates.set(id, {
               label,
               chain,
               liqUsd: liq,
-              volUsd: Number.isFinite(vol) ? vol : 0,
+              volUsd,
+              ageHours,
+              txns,
+              fdv,
+              score: rugScore({ ageHours, liqUsd: liq, volUsd, txns, fdv }),
+              // preserve the last enrichment so promotion can compare across cycles
+              reserveUsd: prev?.reserveUsd,
+              priceTime: prev?.priceTime,
               t: now,
             });
             seen++;
@@ -588,6 +641,117 @@ export class RadarDO {
     if (this.candidates.size <= CAND_CAP) return;
     const byAge = [...this.candidates.entries()].sort((a, b) => a[1].t - b[1].t);
     for (const [id] of byAge.slice(0, this.candidates.size - CAND_CAP)) this.candidates.delete(id);
+  }
+
+  // --- tier 1b: enrichment (key-gated booster) ------------------------------
+  // Deep-probe the top rug-scored candidates via getPoolDetails to (P2) sharpen
+  // their score with short-window sell-skew and (P3) read a per-swap-fresh quote
+  // reserve and PROMOTE pools whose reserve just moved sharply onto the stream
+  // (a wide REST pre-filter the 74 slots can't cover by rotation alone). Bounded
+  // N and concurrency so it never starves the alarm or the stream's connections.
+  // Free tier (no key) skips this entirely and ranks on the pools/filter score.
+  private async enrichTopCandidates(): Promise<void> {
+    const key = this.apiKey();
+    if (!key) return;
+    const n = envInt(this.env.ENRICH_POOLS, ENRICH_TOP_N);
+    if (n <= 0 || this.candidates.size === 0) return;
+    const top = [...this.candidates.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, n);
+    let probed = 0;
+    let promotedNow = 0;
+    await this.mapLimit(top, ENRICH_CONCURRENCY, async ([id, c]) => {
+      const d = await this.fetchPoolDetail(c.chain, id, key);
+      if (!d) return;
+      probed++;
+      const reserveUsd = this.quoteReserveOf(d.token_reserves);
+      const priceTime = Date.parse(String(d.price_time ?? "")) / 1000;
+      const sellSkew = this.shortSellSkew(d);
+      // P3: a sharp quote-reserve move since the last fresh probe = promote to the
+      // stream so it gets block-level confirmation. price_time must advance, else a
+      // quiet pool's frozen snapshot reads as a phantom move.
+      if (
+        c.reserveUsd !== undefined && c.reserveUsd > 0 && Number.isFinite(reserveUsd) &&
+        c.priceTime !== undefined && Number.isFinite(priceTime) && priceTime > c.priceTime &&
+        Math.abs(reserveUsd - c.reserveUsd) / c.reserveUsd >= PROMOTE_MOVE_PCT
+      ) {
+        this.promoted.set(id, { chain: c.chain, label: c.label, t: Date.now() });
+        promotedNow++;
+      }
+      // P2: fold sell-skew into the score; persist the fresh reserve for next cycle.
+      const score = rugScore({ ageHours: c.ageHours, liqUsd: c.liqUsd, volUsd: c.volUsd, txns: c.txns, fdv: c.fdv, sellSkew });
+      this.candidates.set(id, { ...c, score, reserveUsd: Number.isFinite(reserveUsd) ? reserveUsd : c.reserveUsd, priceTime: Number.isFinite(priceTime) ? priceTime : c.priceTime, t: c.t });
+    });
+    // expire stale promotions (the stream's own pinning takes over once it sees the move)
+    for (const [id, m] of this.promoted) if (Date.now() - m.t > PROMOTE_TTL_MS) this.promoted.delete(id);
+    this.lastEnrich = `enriched ${probed}/${top.length}, ${promotedNow} promoted, ${this.promoted.size} pinned`;
+    if (probed) this.note(`enrich ok: ${this.lastEnrich}`);
+  }
+
+  // Run fn over items with bounded concurrency (stay under the Workers/stream
+  // outbound-connection ceiling). Errors are swallowed per-item.
+  private async mapLimit<T>(items: T[], limit: number, fn: (x: T) => Promise<void>): Promise<void> {
+    let i = 0;
+    const worker = async () => {
+      while (i < items.length) {
+        const idx = i++;
+        try {
+          await fn(items[idx]);
+        } catch (e) {
+          this.note(`enrich item failed: ${String(e)}`);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  }
+
+  // getPoolDetails with the key on api-pro; on a WAF 401/403 from this host, retry
+  // once on the free host so enrichment still works from worker IPs.
+  private async fetchPoolDetail(chain: string, id: string, key: string): Promise<any | null> {
+    const hosts: [string, Record<string, string>][] = [
+      ["https://api-pro.dexpaprika.com", { accept: "application/json", authorization: key }],
+      ["https://api.dexpaprika.com", { accept: "application/json" }],
+    ];
+    for (const [base, headers] of hosts) {
+      try {
+        const r = await fetch(`${base}/networks/${chain}/pools/${id}`, { headers });
+        if (r.status === 401 || r.status === 403) continue; // try the next host
+        if (!r.ok) return null;
+        return await r.json();
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  // Quote-valued reserve from a getPoolDetails token_reserves[] (same QUOTE_TOKENS
+  // basis the stream uses): sum the reserve_usd of the SOL/USDC/USDT/... legs.
+  private quoteReserveOf(tokenReserves: unknown): number {
+    if (!Array.isArray(tokenReserves)) return NaN;
+    let sum = 0;
+    let quoted = false;
+    for (const leg of tokenReserves as any[]) {
+      const tid = String(leg?.token_id ?? "");
+      if (QUOTE_TOKENS.has(tid) || QUOTE_TOKENS.has(tid.toLowerCase())) {
+        const v = Number(leg?.reserve_usd);
+        if (Number.isFinite(v)) {
+          sum += v;
+          quoted = true;
+        }
+      }
+    }
+    return quoted ? sum : NaN; // meme/meme pair: no trustworthy quote leg
+  }
+
+  // Short-window sell pressure from getPoolDetails: sell/(buy+sell) over 5m (with
+  // a 15m fallback when 5m is too thin to be meaningful). NaN if no flow.
+  private shortSellSkew(d: any): number | undefined {
+    for (const w of ["5m", "15m"]) {
+      const buy = Number(d?.[w]?.buy_usd);
+      const sell = Number(d?.[w]?.sell_usd);
+      const total = (Number.isFinite(buy) ? buy : 0) + (Number.isFinite(sell) ? sell : 0);
+      if (total > 0) return (Number.isFinite(sell) ? sell : 0) / total;
+    }
+    return undefined;
   }
 
   // The real "rising" signal: read from the live stream's quote-valued reserves,
@@ -617,13 +781,19 @@ export class RadarDO {
   }
 
   // Pools that must stay on the stream through rotation: anything moving (up or
-  // down) past PIN_MOVE_THRESHOLD in the window, plus drains mid-confirmation.
+  // down) past PIN_MOVE_THRESHOLD in the window, plus drains mid-confirmation,
+  // plus pools the REST enrichment pass just flagged as movers (within TTL).
   private pinnedIds(): Set<string> {
     const ids = new Set<string>();
     for (const subject of this.pending.keys()) ids.add(subject);
     for (const subject of this.series.keys()) {
       const chg = this.streamChange(subject, STREAM_RISE_WINDOW_S);
       if (chg !== null && Math.abs(chg) >= PIN_MOVE_THRESHOLD) ids.add(subject);
+    }
+    const now = Date.now();
+    for (const [id, m] of this.promoted) {
+      if (now - m.t <= PROMOTE_TTL_MS) ids.add(id);
+      else this.promoted.delete(id);
     }
     return ids;
   }
@@ -665,10 +835,12 @@ export class RadarDO {
     const now = Date.now();
     if (now - this.lastStreamPickMs < STREAM_REFRESH_MS) return;
     const cap = this.streamTargets();
-    // Candidate universe, ranked by 24h turnover (live, trustworthy field).
+    // Candidate universe, ranked by composite rug-risk score (age x churn x thin
+    // float x wash, plus enrichment sell-skew), NOT raw volume: that wasted slots
+    // on huge blue chips that never rug.
     const ranked = [...this.candidates.entries()]
       .map(([id, c]) => ({ id, ...c }))
-      .sort((a, b) => b.volUsd - a.volUsd);
+      .sort((a, b) => b.score - a.score);
     if (ranked.length < cap) return; // not enough discovered yet; stay on cold-start list
 
     const prev = (await this.state.storage.get<WatchEntry[]>("streamWatchlist")) ?? [];
@@ -992,8 +1164,8 @@ export class RadarDO {
 <p>mode: <strong>${escapeHtml(mode)}</strong> · ${escapeHtml(keyMode)}<br>
 stream: ${escapeHtml(this.configSource)}<br>
 stream health: ${this.streamStarts} starts · ${this.streamErrCount} errors${this.lastStreamErr ? ` · last err: <code>${escapeHtml(this.lastStreamErr)}</code>` : ""}<br>
-scanner: ${this.candidates.size} candidates discovered · last scan ${escapeHtml(lastScan)}<br>
-${escapeHtml(this.thresholds)}<br>last raw msg incl ping: ${escapeHtml(lastRaw)} · last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
+scanner: ${this.candidates.size} candidates discovered (ranked by rug-risk score) · last scan ${escapeHtml(lastScan)}<br>
+${this.lastEnrich ? `enrichment: ${escapeHtml(this.lastEnrich)}<br>` : ""}${escapeHtml(this.thresholds)}<br>last raw msg incl ping: ${escapeHtml(lastRaw)} · last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
 ${paused}${postError}
 <h2>Recent drains</h2>

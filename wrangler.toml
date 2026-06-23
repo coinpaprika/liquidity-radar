@@ -33,22 +33,31 @@ POSTS_PER_HOUR = "6"
 DRAIN_CONFIRM_SECONDS = "90"   # a drain must hold this long before it posts; a drop that refills is suppressed
 POST_ADDS = "0"                # rug feed: drains only. set "1" to also post liquidity adds
 
-# Cold-start stream watchlist size per chain. Used only until the liquidity
-# scanner has growth data, then the stream re-points at the fastest-rising pools.
+# Cold-start stream watchlist size per chain. Used only until the scanner has
+# discovered enough candidates to fill the rug-scored rotate-and-pin selection.
 # The free keyless reserve stream allows 3 connections per IP (probed live), 25
 # subs each, so ~74 pools is the free ceiling; 37/chain packs into exactly 3
 # connections. Bump only with an enterprise key that lifts the stream limit.
 POOLS_PER_CHAIN = "37"
 
-# Liquidity scanner (tier 1): every SCAN_INTERVAL_SECONDS the DO pages through
-# each chain's small + recently-created pools via /pools/filter and records
-# liquidity_usd, then ranks the fastest-rising and hands the top ~74 to the
-# reserve stream. liquidity_usd is a ~20-30s aggregate (probed), so polling
-# faster than ~30s just re-reads the same numbers; 60s is the sweet spot.
-# SCAN_PAGES x 100 = pools scanned per chain per cycle. REST is a burst limiter
-# (~30 req / 20s window), so pages are paced; keep SCAN_PAGES modest.
+# Candidate discovery (tier 1): every SCAN_INTERVAL_SECONDS the DO pages through
+# each chain's small + recently-created pools via /pools/filter and ranks them by
+# a composite RUG-RISK SCORE (age x turnover x thin-float x wash), NOT raw volume.
+# The top-scored pools fill the reserve-stream rotation. (Rising/draining are read
+# from the live stream, not from REST liquidity_usd, which is too stale per probe.)
+# SCAN_PAGES x 100 = pools scanned per chain per cycle. Free REST is a burst
+# limiter (~30 req / 20s window), so pages are paced; keep SCAN_PAGES modest.
 SCAN_PAGES = "6"
 SCAN_INTERVAL_SECONDS = "60"
+
+# Enrichment (tier 1b, KEY-GATED booster, no effect without DEXPAPRIKA_API_KEY):
+# each scan cycle, deep-probe the top ENRICH_POOLS rug-scored candidates via
+# getPoolDetails to (1) sharpen the score with short-window sell-skew and (2) read
+# a per-swap-fresh quote reserve and PROMOTE pools that just moved sharply onto the
+# stream (a wide REST pre-filter the rotation can't reach alone). Bounded so it
+# never starves the alarm. Set "0" to disable; raise it on a paid Workers plan
+# (more subrequest headroom) for wider REST coverage.
+ENRICH_POOLS = "24"
 
 # Proactively recycle the reserve-stream connections this often. A single wedged
 # connection among several healthy ones keeps the global silence timer fresh and
@@ -61,10 +70,10 @@ STREAM_MAX_AGE_SECONDS = "600"
 # feed it). So run the stream keyless here (free 3-connection tier, ~75 pools,
 # which DOES deliver from workers) while the scanner keeps the full key. Remove
 # this (or set "0") when running off Workers, or once the dev fixes keyed SSE
-# for worker egress IPs — then the stream gets 7 connections / ~175 pools.
+# for worker egress IPs, then the stream gets 7 connections / ~175 pools.
 STREAM_KEYLESS = "1"
 
-# OPTIONAL Pro/Enterprise API key. NOT set here (it's a secret) — provide it with
+# OPTIONAL Pro/Enterprise API key. NOT set here (it's a secret); provide it with
 #   npx wrangler secret put DEXPAPRIKA_API_KEY
 # (local dev: put DEXPAPRIKA_API_KEY=... in a gitignored .dev.vars). When set:
 #   - the reserve stream sends it as the bare Authorization header, lifting the
