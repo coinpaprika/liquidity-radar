@@ -43,6 +43,8 @@ export interface Env extends SinkEnv {
   POST_COOLDOWN_MINUTES?: string;
   POSTS_PER_HOUR?: string;
   POST_SUFFIX?: string;
+  MIN_DRAIN_USD?: string; // min absolute USD move to flag (overrides watchlist.json minUsd; small pools need a low floor)
+  DRAIN_PCT?: string; // min fraction of reserve to flag, e.g. 0.2 (overrides watchlist.json pctThreshold)
   DRAIN_CONFIRM_SECONDS?: string; // a drain must persist this long before sending (default 90)
   POST_ADDS?: string; // "1" to also post liquidity adds (default off)
   POOLS_PER_CHAIN?: string; // cold-start volume watchlist size per chain (default 37)
@@ -87,7 +89,7 @@ const KEYED_SCAN_PAGES = 12; // ~1200 pools/chain tracked for growth
 const KEYED_PAGE_SPACING_MS = 150;
 const MAX_429_RETRIES = 1; // consecutive 429s on a page before giving up (bounds alarm wall-clock; recover next cycle)
 const MAX_BACKOFF_S = 20; // cap an over-large Retry-After (Retry-After is ~20s; don't sleep longer)
-const SCAN_LIQ_MIN = 10_000; // skip dust
+const SCAN_LIQ_MIN = 3_000; // discover small pools too: PumpSwap rugs happen at low liquidity (skip only true dust)
 const SCAN_LIQ_MAX = 2_000_000; // skip blue-chips: they don't rug
 const SCAN_TXNS_MIN = 50; // must be active
 const SCAN_AGE_DAYS = 7; // recently created = rug-prone
@@ -135,6 +137,10 @@ const STABLES = new Set([
 ]);
 
 function envInt(v: string | undefined, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+function envFloat(v: string | undefined, fallback: number): number {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
@@ -473,8 +479,19 @@ export class RadarDO {
   // Stream targets, in priority order:
   //   WATCHLIST var override -> scanner's top risers -> cold-start volume list -> bundled.
   // The API key (if any) is attached to every variant so the radar authenticates.
+  // Drain thresholds for the dynamic stream config. Small PumpSwap pools rug for
+  // a few thousand USD, well below watchlist.json's blue-chip-oriented default, so
+  // these are env-overridable (tune live, no redeploy) and default LOW.
+  private drainThresholds(): { minUsd: number; pctThreshold: number } {
+    return {
+      minUsd: envInt(this.env.MIN_DRAIN_USD, FALLBACK_WATCHLIST.minUsd ?? 25_000),
+      pctThreshold: envFloat(this.env.DRAIN_PCT, FALLBACK_WATCHLIST.pctThreshold ?? 0.1),
+    };
+  }
+
   private async activeConfig(): Promise<RadarConfig> {
     const apiKey = this.streamKey();
+    const { minUsd, pctThreshold } = this.drainThresholds();
     if (this.env.WATCHLIST) {
       try {
         const parsed = JSON.parse(this.env.WATCHLIST);
@@ -489,7 +506,7 @@ export class RadarDO {
     const stream = await this.state.storage.get<WatchEntry[]>("streamWatchlist");
     if (stream && stream.length) {
       this.configSource = `${stream.length} pools (pinned movers + rotating candidates)`;
-      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: stream, apiKey };
+      return { minUsd, pctThreshold, watch: stream, apiKey };
     }
     // cold start: stream the most active pools until the scanner has growth data
     let dyn = await this.state.storage.get<WatchEntry[]>("dynamicWatchlist");
@@ -499,10 +516,10 @@ export class RadarDO {
     }
     if (dyn && dyn.length) {
       this.configSource = `cold start: ${dyn.length} most-active pools (scanner warming up)`;
-      return { minUsd: FALLBACK_WATCHLIST.minUsd, pctThreshold: FALLBACK_WATCHLIST.pctThreshold, watch: dyn, apiKey };
+      return { minUsd, pctThreshold, watch: dyn, apiKey };
     }
     this.configSource = `bundled watchlist.json (${FALLBACK_WATCHLIST.watch.length} pools)`;
-    return { ...FALLBACK_WATCHLIST, apiKey };
+    return { ...FALLBACK_WATCHLIST, minUsd, pctThreshold, apiKey };
   }
 
   private isStablePair(syms: string[]): boolean {
@@ -1116,7 +1133,8 @@ export class RadarDO {
     const stats = (await this.state.storage.get<Stats>("stats")) ?? emptyStats(now);
     return {
       now,
-      watching: this.meta.size, // pools on the live reserve stream that have emitted
+      watching: this.activeAddrs.size, // pools subscribed on the live reserve stream right now
+      emitting: this.meta.size, // subset of those that have ticked recently
       scanning: this.candidates.size, // pools the REST scanner has discovered as rotation candidates
       hero,
       series: streams.slice(0, 18), // overlaid live lines

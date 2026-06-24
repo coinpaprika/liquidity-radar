@@ -33,6 +33,14 @@ POSTS_PER_HOUR = "6"
 DRAIN_CONFIRM_SECONDS = "90"   # a drain must hold this long before it posts; a drop that refills is suppressed
 POST_ADDS = "0"                # rug feed: drains only. set "1" to also post liquidity adds
 
+# Drain detection thresholds. A move is flagged only if it is BOTH >= MIN_DRAIN_USD
+# in absolute terms AND >= DRAIN_PCT of the pool's reserve. Small PumpSwap pools
+# rug for a few thousand dollars, so the floor must be low to catch them; the pct
+# gate (and the confirm-hold above) keep noise out. Raise MIN_DRAIN_USD to focus
+# on bigger events. These override watchlist.json's blue-chip-oriented defaults.
+MIN_DRAIN_USD = "2000"
+DRAIN_PCT = "0.2"
+
 # Cold-start stream watchlist size per chain. Used only until the scanner has
 # discovered enough candidates to fill the rug-scored rotate-and-pin selection.
 # The free keyless reserve stream allows 3 connections per IP (probed live), 25
@@ -45,9 +53,10 @@ POOLS_PER_CHAIN = "37"
 # a composite RUG-RISK SCORE (age x turnover x thin-float x wash), NOT raw volume.
 # The top-scored pools fill the reserve-stream rotation. (Rising/draining are read
 # from the live stream, not from REST liquidity_usd, which is too stale per probe.)
-# SCAN_PAGES x 100 = pools scanned per chain per cycle. Free REST is a burst
-# limiter (~30 req / 20s window), so pages are paced; keep SCAN_PAGES modest.
-SCAN_PAGES = "6"
+# SCAN_PAGES x 100 = pools scanned per chain per cycle (deeper = bigger discovery
+# universe to rotate through). With the enterprise key the REST burst limit is
+# gone, so on a paid Workers plan we scan deep; on the free tier keep this ~4-6.
+SCAN_PAGES = "15"
 SCAN_INTERVAL_SECONDS = "60"
 
 # Enrichment (tier 1b, KEY-GATED booster, no effect without DEXPAPRIKA_API_KEY):
