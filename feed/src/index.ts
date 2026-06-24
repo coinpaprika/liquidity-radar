@@ -59,7 +59,7 @@ export interface Env extends SinkEnv {
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
 const ALARM_INTERVAL_MS = 30_000;
-const PERSIST_FRACTION = 0.5; // a confirmed drain is still down to <= this fraction of pre-drain
+const PERSIST_FRACTION = 0.5; // confirmed if, after the hold, the reserve is still down by >= this fraction of the DRAIN (i.e. it didn't refill); works for small and large drains alike
 const SERIES_CAP = 120; // rolling reserve points kept per streamed pool for the live chart
 const REFRESH_MS = 60 * 60 * 1000; // rebuild the cold-start volume watchlist hourly
 // Pools per chain in the cold-start volume watchlist (used until the scanner has
@@ -979,7 +979,12 @@ export class RadarDO {
       if (now - p.atMs < confirmMs) continue;
       this.pending.delete(subject);
       const cur = this.lastReserve.get(subject);
-      const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd * PERSIST_FRACTION;
+      // "Held" = the reserve has not refilled most of the drained amount. Measured
+      // against the DRAIN itself, not an absolute fraction of the pre-drain size,
+      // so a small drain ($250 off a $10k pool) confirms when it sticks, instead
+      // of being wrongly suppressed for not having halved the whole pool.
+      const drainAmt = Math.abs(p.alert.deltaUsd);
+      const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
       if (stillDrained) {
         await this.commit(p.alert);
       } else {

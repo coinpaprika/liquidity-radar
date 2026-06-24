@@ -29,17 +29,19 @@ crons = ["*/5 * * * *"] # bootstraps the DO after deploy, keeps it alive
 # pool can't flood your channel.
 [vars]
 POST_COOLDOWN_MINUTES = "30"
-POSTS_PER_HOUR = "6"
+POSTS_PER_HOUR = "20"   # a frequent rug feed: lift the hourly cap so real drains aren't throttled (still per-pool cooldown above)
 DRAIN_CONFIRM_SECONDS = "90"   # a drain must hold this long before it posts; a drop that refills is suppressed
 POST_ADDS = "0"                # rug feed: drains only. set "1" to also post liquidity adds
 
 # Drain detection thresholds. A move is flagged only if it is BOTH >= MIN_DRAIN_USD
-# in absolute terms AND >= DRAIN_PCT of the pool's reserve. Small PumpSwap pools
-# rug for a few thousand dollars, so the floor must be low to catch them; the pct
-# gate (and the confirm-hold above) keep noise out. Raise MIN_DRAIN_USD to focus
-# on bigger events. These override watchlist.json's blue-chip-oriented defaults.
-MIN_DRAIN_USD = "2000"
-DRAIN_PCT = "0.2"
+# in absolute terms AND >= DRAIN_PCT of the pool's reserve. We want EVERY drain over
+# $250 and nothing under, so the floor is $250. DRAIN_PCT is a low noise guard
+# (5%): the real noise control is the swap filter (a drain needs the quote leg
+# down with no token leg rising = a liquidity pull, not a sell), so the pct can be
+# low without flooding. Drop DRAIN_PCT further to also catch sub-5% pulls from
+# bigger pools; raise MIN_DRAIN_USD to focus on larger rugs. Tunable live.
+MIN_DRAIN_USD = "250"
+DRAIN_PCT = "0.05"
 
 # Cold-start stream watchlist size per chain. Used only until the scanner has
 # discovered enough candidates to fill the rug-scored rotate-and-pin selection.
