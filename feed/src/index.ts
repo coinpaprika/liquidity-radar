@@ -35,6 +35,7 @@ import {
 } from "../../core/src/index.js";
 import { isLive, postAlert, type SinkEnv } from "./webhook.js";
 import { LANDING_HTML } from "./page.js";
+import { RADAR_HTML } from "./radar.js";
 import bundledWatchlist from "../../watchlist.json";
 
 export interface Env extends SinkEnv {
@@ -228,7 +229,7 @@ export default {
     if (req.method !== "GET") return new Response("method not allowed", { status: 405 });
     const url = new URL(req.url);
     if (url.pathname === "/health") return new Response("ok", { status: 200 });
-    if (!["/", "/api/live", "/status"].includes(url.pathname)) {
+    if (!["/", "/radar", "/api/live", "/status"].includes(url.pathname)) {
       return new Response("not found", { status: 404 });
     }
     const cache = caches.default;
@@ -292,6 +293,11 @@ export class RadarDO {
     }
     if (url.pathname === "/") {
       return new Response(LANDING_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=10" },
+      });
+    }
+    if (url.pathname === "/radar") {
+      return new Response(RADAR_HTML, {
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=10" },
       });
     }
