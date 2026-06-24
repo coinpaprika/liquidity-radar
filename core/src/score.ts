@@ -64,5 +64,8 @@ export function rugScore(f: RugScoreFeatures): number {
   if (typeof f.sellSkew === "number" && Number.isFinite(f.sellSkew)) {
     score *= 1 + Math.max(0, f.sellSkew - 0.5) * 1.5;
   }
-  return score;
+  // Enforce the contract at the source: always a finite, non-negative number. A
+  // NaN here (e.g. a non-finite input from a future caller) would poison the
+  // sort comparators that rank stream-slot candidates.
+  return Number.isFinite(score) ? Math.max(0, score) : 0;
 }

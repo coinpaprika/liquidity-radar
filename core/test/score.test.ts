@@ -34,3 +34,12 @@ test("zero / missing liquidity never yields NaN", () => {
   const s = rugScore({ ageHours: 1, liqUsd: 0, volUsd: 0, txns: 0, fdv: 0 });
   assert.ok(Number.isFinite(s), "score must be finite even with empty inputs");
 });
+
+test("non-finite inputs are clamped to a finite, non-negative score (sort-safe)", () => {
+  for (const bad of [NaN, Infinity, -Infinity]) {
+    const s = rugScore({ ageHours: 3, liqUsd: 50_000, volUsd: bad, txns: 3_000, fdv: 1_000_000 });
+    assert.ok(Number.isFinite(s) && s >= 0, `volUsd=${bad} must yield a finite non-negative score, got ${s}`);
+  }
+  const skewBad = rugScore({ ageHours: 3, liqUsd: 50_000, volUsd: 150_000, txns: 3_000, fdv: 1_000_000, sellSkew: NaN });
+  assert.ok(Number.isFinite(skewBad) && skewBad >= 0, "NaN sellSkew must not poison the score");
+});

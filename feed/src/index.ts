@@ -85,8 +85,8 @@ const PAGE_SPACING_MS = 900; // pace pages: free REST is a burst limiter (~30 re
 // so scan far deeper and barely pace.
 const KEYED_SCAN_PAGES = 12; // ~1200 pools/chain tracked for growth
 const KEYED_PAGE_SPACING_MS = 150;
-const MAX_429_RETRIES = 2; // consecutive 429s on a page before giving up (don't freeze the alarm)
-const MAX_BACKOFF_S = 30; // cap an over-large Retry-After
+const MAX_429_RETRIES = 1; // consecutive 429s on a page before giving up (bounds alarm wall-clock; recover next cycle)
+const MAX_BACKOFF_S = 20; // cap an over-large Retry-After (Retry-After is ~20s; don't sleep longer)
 const SCAN_LIQ_MIN = 10_000; // skip dust
 const SCAN_LIQ_MAX = 2_000_000; // skip blue-chips: they don't rug
 const SCAN_TXNS_MIN = 50; // must be active
@@ -99,7 +99,9 @@ const STREAM_REFRESH_MS = 5 * 60 * 1000; // rotate/re-point the stream at most t
 // (sharpens selection) and a per-swap-fresh quote reserve (promotes movers to the
 // stream). Free tier ranks on the pools/filter score alone; no detail calls.
 const ENRICH_TOP_N = 24; // top candidates to deep-probe each scan cycle
-const ENRICH_CONCURRENCY = 3; // bounded: stay under the Workers/stream outbound-connection ceiling
+const ENRICH_CONCURRENCY = 2; // bounded: 2 REST + up to 3 keyless stream conns + 1 spare <= Workers ~6 ceiling
+const ENRICH_FETCH_TIMEOUT_MS = 5_000; // per getPoolDetails call: a hung origin must never pin a worker
+const ENRICH_DEADLINE_MS = 20_000; // hard cap on the whole enrich pass, so it can't dominate the alarm
 const PROMOTE_MOVE_PCT = 0.15; // quote-reserve move between probes that promotes a pool to the stream
 const PROMOTE_TTL_MS = 4 * 60 * 1000; // a REST-promoted pin lasts this long (until the stream takes over)
 // "Rising" is read from the live stream's real quote-valued reserves, not REST.
@@ -516,16 +518,17 @@ export class RadarDO {
     return Number.isFinite(ms) ? Math.max(0, (Date.now() - ms) / 3_600_000) : NaN;
   }
   // FDV of the risky (non-quote) leg. The quote token (USDC/SOL/...) has a huge,
-  // irrelevant FDV, so pick the non-quote token; fall back to max if both/neither.
+  // irrelevant FDV, so pick the non-quote token. A quote/quote pair (e.g.
+  // SOL/WETH) has no risky leg, so FDV is "unknown" (0), never the quote's FDV.
   private riskyFdv(p: any): number {
     const toks = (p.tokens ?? []) as any[];
     const risky = toks.filter((t) => {
       const id = String(t.id ?? "");
       return !(QUOTE_TOKENS.has(id) || QUOTE_TOKENS.has(id.toLowerCase()));
     });
-    const pick = risky.length ? risky : toks;
+    if (!risky.length) return 0; // quote/quote: unknown FDV, not the quote's
     let fdv = 0;
-    for (const t of pick) {
+    for (const t of risky) {
       const v = Number(t.fdv);
       if (Number.isFinite(v) && v > fdv) fdv = v;
     }
@@ -658,7 +661,7 @@ export class RadarDO {
     const top = [...this.candidates.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, n);
     let probed = 0;
     let promotedNow = 0;
-    await this.mapLimit(top, ENRICH_CONCURRENCY, async ([id, c]) => {
+    await this.mapLimit(top, ENRICH_CONCURRENCY, ENRICH_DEADLINE_MS, async ([id, c]) => {
       const d = await this.fetchPoolDetail(c.chain, id, key);
       if (!d) return;
       probed++;
@@ -687,11 +690,13 @@ export class RadarDO {
   }
 
   // Run fn over items with bounded concurrency (stay under the Workers/stream
-  // outbound-connection ceiling). Errors are swallowed per-item.
-  private async mapLimit<T>(items: T[], limit: number, fn: (x: T) => Promise<void>): Promise<void> {
+  // outbound-connection ceiling) AND a wall-clock deadline (stop pulling new items
+  // past it, so the pass can never dominate the alarm). Errors swallowed per-item.
+  private async mapLimit<T>(items: T[], limit: number, deadlineMs: number, fn: (x: T) => Promise<void>): Promise<void> {
     let i = 0;
+    const deadline = Date.now() + deadlineMs;
     const worker = async () => {
-      while (i < items.length) {
+      while (i < items.length && Date.now() < deadline) {
         const idx = i++;
         try {
           await fn(items[idx]);
@@ -704,7 +709,9 @@ export class RadarDO {
   }
 
   // getPoolDetails with the key on api-pro; on a WAF 401/403 from this host, retry
-  // once on the free host so enrichment still works from worker IPs.
+  // once on the free host so enrichment still works from worker IPs. Each call is
+  // hard-bounded by a timeout: a hung origin must never pin an enrich worker and
+  // stall the alarm (and with it the stream watchdog).
   private async fetchPoolDetail(chain: string, id: string, key: string): Promise<any | null> {
     const hosts: [string, Record<string, string>][] = [
       ["https://api-pro.dexpaprika.com", { accept: "application/json", authorization: key }],
@@ -712,12 +719,15 @@ export class RadarDO {
     ];
     for (const [base, headers] of hosts) {
       try {
-        const r = await fetch(`${base}/networks/${chain}/pools/${id}`, { headers });
+        const r = await fetch(`${base}/networks/${chain}/pools/${id}`, {
+          headers,
+          signal: AbortSignal.timeout(ENRICH_FETCH_TIMEOUT_MS),
+        });
         if (r.status === 401 || r.status === 403) continue; // try the next host
         if (!r.ok) return null;
         return await r.json();
       } catch {
-        continue;
+        continue; // timeout / network: skip this pool (and host)
       }
     }
     return null;
