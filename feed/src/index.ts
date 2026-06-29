@@ -114,6 +114,7 @@ const PROMOTE_TTL_MS = 4 * 60 * 1000; // a REST-promoted pin lasts this long (un
 const RUG_COMPLETENESS = 0.8; // pulled >= this fraction of the pool, token liquidity gone => "rug"
 const MIGRATION_MIN_USD = 5_000; // token liquidity elsewhere >= this (and >= pulled) => "migration"
 const CLASSIFY_TIMEOUT_MS = 5_000; // per token-liquidity lookup at confirm time
+const CLASSIFY_MAX_PER_CYCLE = 8; // bound the confirm-time lookups so a burst can't stall the alarm (rest commit as "unknown")
 // "Rising" is read from the live stream's real quote-valued reserves, not REST.
 // A pool counts as rising when its reserve climbs >= this over the look-back.
 const STREAM_RISE_WINDOW_S = 600; // 10 min of streamed history defines the trend
@@ -1006,6 +1007,7 @@ export class RadarDO {
   private async resolvePending(): Promise<void> {
     const now = Date.now();
     const confirmMs = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90) * 1000;
+    let classified = 0;
     for (const [subject, p] of [...this.pending]) {
       if (now - p.atMs < confirmMs) continue;
       this.pending.delete(subject);
@@ -1017,7 +1019,9 @@ export class RadarDO {
       const drainAmt = Math.abs(p.alert.deltaUsd);
       const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
       if (stillDrained) {
-        const intent = await this.classifyDrain(p.alert);
+        // bound confirm-time lookups per cycle; a burst commits as "unknown" rather than stalling the alarm
+        const intent = classified < CLASSIFY_MAX_PER_CYCLE ? await this.classifyDrain(p.alert) : "unknown";
+        classified++;
         await this.commit(p.alert, intent);
       } else {
         await this.record(p.alert, false, "suppressed: refilled");
