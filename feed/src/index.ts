@@ -46,6 +46,8 @@ export interface Env extends SinkEnv {
   POST_SUFFIX?: string;
   MIN_DRAIN_USD?: string; // min absolute USD move to flag (overrides watchlist.json minUsd; small pools need a low floor)
   DRAIN_PCT?: string; // min fraction of reserve to flag, e.g. 0.2 (overrides watchlist.json pctThreshold)
+  RUG_COMPLETENESS?: string; // fraction pulled (with token liquidity gone) to label a confirmed drain a "rug" (default 0.8)
+  MIGRATION_MIN_USD?: string; // token liquidity left elsewhere to label a drain a "migration" not a rug (default 5000)
   DRAIN_CONFIRM_SECONDS?: string; // a drain must persist this long before sending (default 90)
   POST_ADDS?: string; // "1" to also post liquidity adds (default off)
   POOLS_PER_CHAIN?: string; // cold-start volume watchlist size per chain (default 37)
@@ -107,6 +109,11 @@ const ENRICH_FETCH_TIMEOUT_MS = 5_000; // per getPoolDetails call: a hung origin
 const ENRICH_DEADLINE_MS = 20_000; // hard cap on the whole enrich pass, so it can't dominate the alarm
 const PROMOTE_MOVE_PCT = 0.15; // quote-reserve move between probes that promotes a pool to the stream
 const PROMOTE_TTL_MS = 4 * 60 * 1000; // a REST-promoted pin lasts this long (until the stream takes over)
+// Intent classification of a CONFIRMED drain (defaults; env-overridable). We can't
+// know intent for sure, so this is a labelled inference from observable signals.
+const RUG_COMPLETENESS = 0.8; // pulled >= this fraction of the pool, token liquidity gone => "rug"
+const MIGRATION_MIN_USD = 5_000; // token liquidity elsewhere >= this (and >= pulled) => "migration"
+const CLASSIFY_TIMEOUT_MS = 5_000; // per token-liquidity lookup at confirm time
 // "Rising" is read from the live stream's real quote-valued reserves, not REST.
 // A pool counts as rising when its reserve climbs >= this over the look-back.
 const STREAM_RISE_WINDOW_S = 600; // 10 min of streamed history defines the trend
@@ -149,15 +156,24 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const FALLBACK_WATCHLIST = bundledWatchlist as unknown as RadarConfig;
 
+// How a confirmed drain reads, inferred from observable signals (never certain):
+//   rug       = pool gutted AND the token has little/no liquidity left anywhere
+//   migration = liquidity still lives in another pool for this token (it moved)
+//   exit      = a partial pull, not gutted, no clear migration
+//   unknown   = couldn't fetch the token's liquidity to judge
+type DrainIntent = "rug" | "migration" | "exit" | "unknown";
+
 interface RecentEntry {
   alert: Alert;
   posted: boolean;
   reason?: string;
+  intent?: DrainIntent;
 }
 interface Stats {
   drains: number;
   sent: number;
   suppressed: number;
+  rugs: number; // confirmed drains classified as a likely rug
   sinceMs: number;
 }
 interface Pending {
@@ -202,7 +218,7 @@ interface Riser {
 
 const RECENT_CAP = 150;
 const emptyGate = (): Gate => ({ posted: {}, lastBySubject: {}, recentPosts: [], pausedUntilMs: 0 });
-const emptyStats = (now: number): Stats => ({ drains: 0, sent: 0, suppressed: 0, sinceMs: now });
+const emptyStats = (now: number): Stats => ({ drains: 0, sent: 0, suppressed: 0, rugs: 0, sinceMs: now });
 
 function escapeHtml(v: unknown): string {
   return String(v).replace(
@@ -270,7 +286,7 @@ export class RadarDO {
   private lastReserve = new Map<string, number>();
   private pending = new Map<string, Pending>();
   private series = new Map<string, { t: number; r: number }[]>();
-  private meta = new Map<string, { label: string; chain: string }>();
+  private meta = new Map<string, { label: string; chain: string; token?: string }>();
   private candidates = new Map<string, Candidate>(); // discovered pools (rotation universe)
   private rotateCursor = 0; // advances each repoint so rotation sweeps the universe
   private activeAddrs = new Set<string>(); // addresses the current radar is subscribed to
@@ -419,7 +435,16 @@ export class RadarDO {
           arr.push({ t: Math.floor(Date.now() / 1000), r: reserve });
           if (arr.length > SERIES_CAP) arr.shift();
           this.series.set(subject, arr);
-          this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain });
+          // remember the non-quote (risky) token mint so a confirmed drain can
+          // check whether the token's liquidity vanished (rug) or moved (migration)
+          let token: string | undefined;
+          if (event.type === "pool_reserves") {
+            for (const leg of event.tokens) {
+              const id = leg.token_id;
+              if (!(QUOTE_TOKENS.has(id) || QUOTE_TOKENS.has(id.toLowerCase()))) { token = id; break; }
+            }
+          }
+          this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain, token });
         },
         onFatal: (err, entries) =>
           this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
@@ -992,7 +1017,8 @@ export class RadarDO {
       const drainAmt = Math.abs(p.alert.deltaUsd);
       const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
       if (stillDrained) {
-        await this.commit(p.alert);
+        const intent = await this.classifyDrain(p.alert);
+        await this.commit(p.alert, intent);
       } else {
         await this.record(p.alert, false, "suppressed: refilled");
         await this.bumpStats({ drains: 1, suppressed: 1 });
@@ -1000,7 +1026,7 @@ export class RadarDO {
     }
   }
 
-  private async commit(alert: Alert): Promise<void> {
+  private async commit(alert: Alert, intent?: DrainIntent): Promise<void> {
     const now = Date.now();
     const gate = (await this.state.storage.get<Gate>("gate")) ?? emptyGate();
     for (const [k, ts] of Object.entries(gate.posted)) if (now - ts > DEDUP_TTL_MS) delete gate.posted[k];
@@ -1021,7 +1047,8 @@ export class RadarDO {
       gate.recentPosts.push(now);
       await this.state.storage.put("gate", gate);
       const suffix = this.env.POST_SUFFIX !== undefined ? this.env.POST_SUFFIX : `\n\n${DATA_CREDIT}`;
-      const result = await postAlert(formatAlert(alert) + suffix, alert, this.env);
+      const tag = alert.kind === "drain" && intent ? `\n${this.intentLabel(intent)}` : "";
+      const result = await postAlert(formatAlert(alert) + tag + suffix, alert, this.env);
       if (result.ok) {
         gate.lastPostAtMs = now;
         delete gate.lastPostError;
@@ -1032,8 +1059,8 @@ export class RadarDO {
       }
       await this.state.storage.put("gate", gate);
     }
-    await this.record(alert, !reason, reason);
-    await this.bumpStats({ drains: 1, sent: reason ? 0 : 1 });
+    await this.record(alert, !reason, reason, intent);
+    await this.bumpStats({ drains: 1, sent: reason ? 0 : 1, rugs: intent === "rug" ? 1 : 0 });
     if (alert.kind === "drain") {
       const dr = (await this.state.storage.get<Record<string, HypMark>>("hyp_dr")) ?? {};
       dr[alert.subject] = { label: alert.label ?? alert.subject, chain: alert.chain, t: now, pct: alert.pct };
@@ -1041,18 +1068,71 @@ export class RadarDO {
     }
   }
 
-  private async record(alert: Alert, posted: boolean, reason?: string): Promise<void> {
+  private async record(alert: Alert, posted: boolean, reason?: string, intent?: DrainIntent): Promise<void> {
     const recent = (await this.state.storage.get<RecentEntry[]>("recent")) ?? [];
-    recent.unshift({ alert, posted, reason });
+    recent.unshift({ alert, posted, reason, intent });
     await this.state.storage.put("recent", recent.slice(0, RECENT_CAP));
   }
 
-  private async bumpStats(d: { drains?: number; sent?: number; suppressed?: number }): Promise<void> {
+  private async bumpStats(d: { drains?: number; sent?: number; suppressed?: number; rugs?: number }): Promise<void> {
     const s = (await this.state.storage.get<Stats>("stats")) ?? emptyStats(Date.now());
     s.drains += d.drains ?? 0;
     s.sent += d.sent ?? 0;
     s.suppressed += d.suppressed ?? 0;
+    s.rugs = (s.rugs ?? 0) + (d.rugs ?? 0);
     await this.state.storage.put("stats", s);
+  }
+
+  // Intent classification of a CONFIRMED drain. We can't know intent for sure, so
+  // this is a labelled inference: did the token's liquidity vanish (rug) or move
+  // to another pool (migration)? `summary.liquidity_usd` from getTokenDetails is
+  // the token's TOTAL liquidity across all its pools; subtracting this gutted
+  // pool's residual leaves what lives elsewhere.
+  private async classifyDrain(alert: Alert): Promise<DrainIntent> {
+    const rugC = envFloat(this.env.RUG_COMPLETENESS, RUG_COMPLETENESS);
+    const migMin = envInt(this.env.MIGRATION_MIN_USD, MIGRATION_MIN_USD);
+    const completeness = Math.min(Math.abs(alert.pct) || 0, 1);
+    const token = this.meta.get(alert.subject)?.token;
+    if (token) {
+      const tokenLiq = await this.fetchTokenLiquidity(alert.chain, token);
+      if (tokenLiq !== null) {
+        const otherLiq = Math.max(0, tokenLiq - 2 * (alert.reserveUsd || 0));
+        if (otherLiq >= Math.max(migMin, alert.prevReserveUsd)) return "migration";
+      }
+    }
+    return completeness >= rugC ? "rug" : "exit";
+  }
+
+  private intentLabel(intent: DrainIntent): string {
+    return intent === "rug"
+      ? "likely rug (liquidity gone)"
+      : intent === "migration"
+        ? "liquidity migrated elsewhere"
+        : intent === "exit"
+          ? "partial exit"
+          : "";
+  }
+
+  // Token-level total liquidity (getTokenDetails.summary.liquidity_usd), timeout-
+  // bounded, key on api-pro with a free-host fallback. null if it can't be read.
+  private async fetchTokenLiquidity(chain: string, token: string): Promise<number | null> {
+    const key = this.apiKey();
+    const hosts: [string, Record<string, string>][] = key
+      ? [["https://api-pro.dexpaprika.com", { accept: "application/json", authorization: key }], ["https://api.dexpaprika.com", { accept: "application/json" }]]
+      : [["https://api.dexpaprika.com", { accept: "application/json" }]];
+    for (const [base, headers] of hosts) {
+      try {
+        const r = await fetch(`${base}/networks/${chain}/tokens/${token}`, { headers, signal: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS) });
+        if (r.status === 401 || r.status === 403) continue;
+        if (!r.ok) return null;
+        const d = (await r.json()) as any;
+        const liq = Number(d?.summary?.liquidity_usd);
+        return Number.isFinite(liq) ? liq : null;
+      } catch {
+        continue;
+      }
+    }
+    return null;
   }
 
   // Record pools the live stream shows rising (the hypothesis: do these drain?).
@@ -1127,7 +1207,7 @@ export class RadarDO {
     const draining = recent
       .filter((r) => r.alert.kind === "drain" && r.reason !== "suppressed: refilled")
       .slice(0, 8)
-      .map((r) => ({ id: r.alert.subject, label: r.alert.label ?? r.alert.subject, chain: r.alert.chain, deltaUsd: r.alert.deltaUsd, pct: r.alert.pct, block: r.alert.block, t: r.alert.timestamp }));
+      .map((r) => ({ id: r.alert.subject, label: r.alert.label ?? r.alert.subject, chain: r.alert.chain, deltaUsd: r.alert.deltaUsd, pct: r.alert.pct, block: r.alert.block, t: r.alert.timestamp, intent: r.intent ?? "unknown" }));
 
     // every streamed pool's recent reserve series, for the multi-line live chart
     const streams: { id: string; label: string; chain: string; changePct: number; pts: { t: number; r: number }[] }[] = [];
@@ -1153,7 +1233,7 @@ export class RadarDO {
       rugWatch,
       draining,
       hypothesis: await this.buildHypothesis(),
-      stats: { drains: stats.drains, sent: stats.sent, suppressed: stats.suppressed },
+      stats: { drains: stats.drains, sent: stats.sent, suppressed: stats.suppressed, rugs: stats.rugs ?? 0 },
     };
   }
 

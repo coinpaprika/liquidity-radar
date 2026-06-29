@@ -43,6 +43,15 @@ POST_ADDS = "0"                # rug feed: drains only. set "1" to also post liq
 MIN_DRAIN_USD = "250"
 DRAIN_PCT = "0.05"
 
+# Intent of a CONFIRMED drain (a labelled inference, never certain). On confirm we
+# fetch the token's TOTAL liquidity (getTokenDetails) to tell a rug from a move:
+#   rug       = pulled >= RUG_COMPLETENESS of the pool AND the token's liquidity is gone
+#   migration = the token still has >= MIGRATION_MIN_USD of liquidity elsewhere (it moved)
+#   exit      = a partial pull, not gutted, no clear migration
+# Raise RUG_COMPLETENESS to be stricter about calling something a rug.
+RUG_COMPLETENESS = "0.8"
+MIGRATION_MIN_USD = "5000"
+
 # Cold-start stream watchlist size per chain. Used only until the scanner has
 # discovered enough candidates to fill the rug-scored rotate-and-pin selection.
 # The free keyless reserve stream allows 3 connections per IP (probed live), 25

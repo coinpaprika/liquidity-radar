@@ -310,7 +310,8 @@ function row(r,key,val,dir,body){
 const cell=r=>'<span class="name">'+esc(r.label)+'</span><span class="chain">'+esc(r.chain)+'</span>';
 const rowRise=r=>row(r,esc(r.label),pct(r.changePct),'up',cell(r)+'<span class="val up">'+pct(r.changePct)+'</span>');
 const rowRug=r=>row(r,esc(r.label),pct(r.changePct)+usd(r.reserveUsd),'up',cell(r)+'<span class="val up">'+pct(r.changePct)+' · '+usd(r.reserveUsd)+'</span>');
-const rowDrain=r=>row(r,esc(r.label)+esc(r.block),usd(r.deltaUsd),'dn',cell(r)+'<span class="val down">'+usd(r.deltaUsd)+' ('+pct(r.pct)+')</span>');
+const itag=r=>{var i=r.intent;if(!i||i==='unknown')return '';var c=i==='migration'?'#fbbf24':i==='exit'?'#ff8a9c':'#ff4d6d';var t=i==='rug'?'likely rug':i==='migration'?'migrated':'partial';return ' <span style="font-size:.82em;font-weight:700;color:'+c+'">'+t+'</span>';};
+const rowDrain=r=>row(r,esc(r.label)+esc(r.block),usd(r.deltaUsd),'dn',cell(r)+'<span class="val down">'+usd(r.deltaUsd)+' ('+pct(r.pct)+')</span>'+itag(r));
 
 const chip=(l,color)=>{const inner='<span class="sw" style="background:'+color+'"></span>'+esc(l.label)+' '+pct(l.changePct);return l.id?'<a class="lg" href="'+dp(l.chain,l.id)+'" target="_blank" rel="noopener" title="Open '+esc(l.label)+' on DexPaprika">'+inner+'</a>':'<span class="lg">'+inner+'</span>';};
 let legendExpanded=false;

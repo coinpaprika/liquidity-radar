@@ -53,6 +53,10 @@ export const RADAR_HTML = `<!doctype html>
   @keyframes slam{0%{transform:translateX(14px);opacity:0}100%{transform:none;opacity:1}}
   .row .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
   .row .nm{font-weight:600;font-size:.9em}
+  .tag{font-size:.66em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:99px;vertical-align:middle}
+  .tag.rug{color:#ff4d6d;background:rgba(255,77,109,.14)}
+  .tag.mig{color:#fbbf24;background:rgba(251,191,36,.14)}
+  .tag.ex{color:#ff8a9c;background:rgba(255,138,156,.12)}
   .row .amt{font-family:var(--mono);color:var(--red);font-weight:700;font-size:.9em}
   .row .sub{color:var(--mut);font-size:.76em;margin-top:1px}
   .empty{color:var(--mut);font-size:.85em;padding:10px 2px}
@@ -93,7 +97,7 @@ export const RADAR_HTML = `<!doctype html>
     <aside>
       <div class="panel">
         <div class="score">
-          <div class="stat caught"><div class="n" id="s_caught" data-t="0">0</div><div class="l">rugs caught</div></div>
+          <div class="stat caught"><div class="n" id="s_caught" data-t="0">0</div><div class="l">likely rugs</div></div>
           <div class="stat"><div class="n" id="s_drained" data-t="0">$0</div><div class="l">drained (recent)</div></div>
           <div class="stat"><div class="n" id="s_watch" data-t="0">0</div><div class="l">on the radar</div></div>
           <div class="stat"><div class="n" id="s_scan" data-t="0">0</div><div class="l">discovered</div></div>
@@ -123,6 +127,7 @@ function hash(s){var h=2166136261;for(var i=0;i<s.length;i++){h^=s.charCodeAt(i)
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function usd(n){n=Math.abs(+n||0);if(n>=1e6)return '$'+(n/1e6).toFixed(2)+'M';if(n>=1e3)return '$'+(n/1e3).toFixed(1)+'k';return '$'+Math.round(n)}
 function ago(t){var s=Math.max(0,Math.floor(Date.now()/1000-t));if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}
+function intentTag(it){if(it==='rug')return ' <span class="tag rug">likely rug</span>';if(it==='migration')return ' <span class="tag mig">migrated</span>';if(it==='exit')return ' <span class="tag ex">partial</span>';return ''}
 
 var blips=[]; // {ang, x, y, color, draining, label, chain, id, changePct}
 var data={};
@@ -137,7 +142,7 @@ function buildBlips(d){
   (d.rugWatch||[]).forEach(function(w){ if(!by[w.id]) by[w.id]={id:w.id,label:w.label,chain:w.chain,changePct:w.changePct,reserve:w.reserveUsd,watch:true,draining:false}; });
   (d.draining||[]).forEach(function(x){
     var e=by[x.id]||{id:x.id,label:x.label,chain:x.chain,changePct:x.pct,reserve:0};
-    e.draining=true; e.deltaUsd=x.deltaUsd; by[x.id]=e;
+    e.draining=true; e.intent=x.intent||'unknown'; e.deltaUsd=x.deltaUsd; by[x.id]=e;
   });
   var arr=Object.keys(by).map(function(k){return by[k]});
   // log radius scale: thin liquidity -> near center
@@ -151,7 +156,7 @@ function buildBlips(d){
     var rr=(ang-90)*Math.PI/180;
     a.ang=ang; a.x=100+rad*Math.cos(rr); a.y=100+rad*Math.sin(rr);
     a.size=2+norm*2.4;
-    a.color=a.draining?'#ff4d6d':(a.changePct>=0.05?'#00ff88':(a.changePct<=-0.05?'#ff4d6d':(a.watch?'#fbbf24':'#5b6b80')));
+    a.color=a.draining?(a.intent==='migration'?'#fbbf24':(a.intent==='exit'?'#ff8a9c':'#ff4d6d')):(a.changePct>=0.05?'#00ff88':(a.changePct<=-0.05?'#ff4d6d':(a.watch?'#fbbf24':'#5b6b80')));
   });
   return arr;
 }
@@ -160,7 +165,7 @@ function renderScope(d){
   var g=$('blips'); g.innerHTML='';
   blips=buildBlips(d);
   blips.forEach(function(a){
-    if(a.draining){
+    if(a.draining && a.intent!=='migration' && a.intent!=='exit'){
       var ring=document.createElementNS(NS,'circle');
       ring.setAttribute('cx',a.x);ring.setAttribute('cy',a.y);ring.setAttribute('r','3');
       ring.setAttribute('fill','none');ring.setAttribute('stroke','#ff4d6d');ring.setAttribute('stroke-width','0.7');
@@ -190,7 +195,9 @@ function renderFeed(d){
   else{
     f.innerHTML=dr.slice(0,8).map(function(x){
       var p=(x.pct!=null?(x.pct*100).toFixed(1)+'%':'new');
-      return '<a class="row" href="'+dp(x.chain,x.id)+'" target="_blank" rel="noopener"><div class="top"><span class="nm">'+esc(x.label||x.id)+'</span><span class="amt">-'+usd(x.deltaUsd)+'</span></div><div class="sub">'+esc(x.chain)+' · -'+p+' · '+ago(x.t)+'</div></a>';
+      var it=x.intent||'unknown';
+      var bc=it==='migration'?'#fbbf24':(it==='exit'?'#ff8a9c':'#ff4d6d');
+      return '<a class="row" style="border-left-color:'+bc+'" href="'+dp(x.chain,x.id)+'" target="_blank" rel="noopener"><div class="top"><span class="nm">'+esc(x.label||x.id)+intentTag(it)+'</span><span class="amt">-'+usd(x.deltaUsd)+'</span></div><div class="sub">'+esc(x.chain)+' · -'+p+' · '+ago(x.t)+'</div></a>';
     }).join('');
   }
   var cw=d.rugWatch||[];
@@ -210,7 +217,7 @@ function stepCounters(){
 function render(d){
   data=d;
   $('hdr').textContent=(d.watching||0)+' on the radar · '+(d.scanning||0).toLocaleString()+' discovered';
-  setT('s_caught',d.stats?d.stats.drains:0);
+  setT('s_caught',d.stats?(d.stats.rugs||0):0);
   setT('s_drained',(d.draining||[]).reduce(function(a,x){return a+Math.abs(x.deltaUsd||0)},0));
   setT('s_watch',d.watching||0);
   setT('s_scan',d.scanning||0);
