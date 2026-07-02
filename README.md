@@ -2,15 +2,20 @@
 
 [![CI](https://github.com/coinpaprika/liquidity-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/coinpaprika/liquidity-radar/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/coinpaprika/liquidity-radar)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/coinpaprika/liquidity-radar)
 
 Real-time alerts when DEX liquidity drains or spikes. Watch a pool get rugged
 the block it happens, not 30 seconds later when the money is already gone.
+
+**[Live demo: watch pools rug in real time &rarr;](https://liquidity-radar-dexpaprika.coinpaprika.workers.dev)**
 
 On its first night running, it caught a fresh Base pool draining **-97.3%
 ($67k) in a single block**. That's the kind of event it exists for.
 
 Built on the [DexPaprika](https://dexpaprika.com) Reserve Stream API. **No API
-key. No KYC. Free.**
+key. No KYC. Free.** Forking it is editing one JSON file and running one
+deploy command; the whole stack is a single Worker on a free, keyless stream.
 
 ## See it work in 5 seconds
 
