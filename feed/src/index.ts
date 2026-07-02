@@ -453,7 +453,17 @@ export class RadarDO {
               if (!(QUOTE_TOKENS.has(id) || QUOTE_TOKENS.has(id.toLowerCase()))) { token = id; break; }
             }
           }
-          this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain, token });
+          // Prefer a real pair label: keep an already-resolved one, else the
+          // subscription entry's, else the enriched candidate's. /pools/search rows
+          // carry no token symbols, so a rotated-in pool's entry can be "?/?" until
+          // enrichment backfills the candidate; never downgrade a good label to a
+          // placeholder on a later event. (candidate key == subject for solana; eth
+          // may differ in case and just falls back to the entry label.)
+          const good = (l?: string) => !!l && !l.startsWith("?");
+          const prevLabel = this.meta.get(subject)?.label;
+          const candLabel = this.candidates.get(subject)?.label;
+          const label = good(prevLabel) ? prevLabel! : good(entry.label) ? entry.label! : good(candLabel) ? candLabel! : (entry.label ?? subject);
+          this.meta.set(subject, { label, chain: event.chain, token });
         },
         onFatal: (err, entries) =>
           this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
