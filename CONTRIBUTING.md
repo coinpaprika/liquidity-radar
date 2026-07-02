@@ -4,7 +4,7 @@ Thanks for looking under the hood. The codebase is small on purpose:
 
 ```
 core/   the engine: zero dependencies, runs anywhere fetch exists
-feed/   Cloudflare Worker for the live X feed
+feed/   Cloudflare Worker + Durable Object: the 24/7 alert feed + status page
 cli/    thin wrapper around core
 ```
 
