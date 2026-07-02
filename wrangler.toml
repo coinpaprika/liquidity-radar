@@ -75,12 +75,13 @@ SCAN_INTERVAL_SECONDS = "60"
 
 # Enrichment (tier 1b, KEY-GATED booster, no effect without DEXPAPRIKA_API_KEY):
 # each scan cycle, deep-probe the top ENRICH_POOLS rug-scored candidates via
-# getPoolDetails to (1) sharpen the score with short-window sell-skew and (2) read
-# a per-swap-fresh quote reserve and PROMOTE pools that just moved sharply onto the
-# stream (a wide REST pre-filter the rotation can't reach alone). Bounded so it
-# never starves the alarm. Set "0" to disable; raise it on a paid Workers plan
-# (more subrequest headroom) for wider REST coverage.
-ENRICH_POOLS = "24"
+# getPoolDetails to (1) sharpen the score with short-window sell-skew, (2) read a
+# per-swap-fresh quote reserve and PROMOTE pools that just moved sharply onto the
+# stream, and (3) backfill the real pair label + FDV that /pools/search rows lack.
+# Set to cover the streamed set (~74 keyless) so streamed pools aren't shown as
+# "?/?"; the top-scored pools enrich first, so a partial cycle still labels the
+# riskiest. Bounded so it never starves the alarm. Set "0" to disable.
+ENRICH_POOLS = "74"
 
 # Proactively recycle the reserve-stream connections this often. A single wedged
 # connection among several healthy ones keeps the global silence timer fresh and

@@ -1109,6 +1109,15 @@ export class RadarDO {
       const drainAmt = Math.abs(p.alert.deltaUsd);
       const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
       if (stillDrained) {
+        // A public alert must never read "?/?": /pools/search rows carry no token
+        // symbols, so a pool streamed via rotation (not in the enriched top set)
+        // keeps a placeholder label. Resolve it from getPoolDetails now, before the
+        // drain goes out. Bounded with the classify budget so a burst can't stall.
+        if (classified < CLASSIFY_MAX_PER_CYCLE && (!p.alert.label || p.alert.label.startsWith("?"))) {
+          const d = await this.fetchPoolDetail(p.alert.chain, p.alert.subject, this.apiKey());
+          const lbl = d ? this.labelFromDetail(d) : null;
+          if (lbl) p.alert.label = lbl;
+        }
         // Cumulative fraction of the pool gone from the pre-drain baseline to the
         // reserve now (both known here). This, not a single frozen stream event's
         // pct, is what tells a full rug from a partial exit. undefined when we have
