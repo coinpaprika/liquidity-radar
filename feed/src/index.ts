@@ -117,6 +117,11 @@ const PROMOTE_TTL_MS = 4 * 60 * 1000; // a REST-promoted pin lasts this long (un
 const FRESH_ENRICH_KEYED = 40; // top-volume fresh pools to probe per chain (keyed: no burst limit)
 const FRESH_ENRICH_FREE = 6; // free tier: tiny (REST is a burst limiter shared with the stream)
 const FRESH_DEADLINE_MS = 15_000; // hard cap on the fresh-pool enrichment pass
+// Streamed pools ranked outside the enriched top set (pinned movers, promotions,
+// cold-start remnants) keep a "?/?" label; resolve a bounded few per alarm so the
+// live dashboard converges to real names. Self-limits to nothing once resolved.
+const LABEL_FIX_MAX = 12; // "?/?" streamed pools to resolve per alarm
+const LABEL_FIX_DEADLINE_MS = 8_000; // hard cap on the label-backfill pass
 // Intent classification of a CONFIRMED drain (defaults; env-overridable). We can't
 // know intent for sure, so this is a labelled inference from observable signals.
 const RUG_COMPLETENESS = 0.8; // pulled >= this fraction of the pool, token liquidity gone => "rug"
@@ -357,6 +362,7 @@ export class RadarDO {
       await this.ensureRunning(); // if the re-point stopped the radar, restart it now (no 30s gap)
     }
     await this.updateHypothesis();
+    await this.backfillStreamLabels();
   }
 
   // Self-heal the failure mode the user hit: scanner fine, stream silent. A
@@ -777,6 +783,26 @@ export class RadarDO {
     const syms = ((d?.tokens ?? []) as any[]).map((t) => t?.symbol).filter(Boolean).slice(0, 2);
     if (syms.length < 2) return null;
     return `${syms.join("/")} (${String(d?.dex_name ?? d?.dex_id ?? "?")})`;
+  }
+
+  // Resolve the real pair label for streamed pools still showing "?/?" (pinned
+  // movers / promotions / cold-start pools that never passed through enrichment).
+  // onEvent preserves a good label once set, so a one-time resolve here sticks and
+  // the dashboard converges. Bounded N + concurrency + deadline; a no-op once clean.
+  private async backfillStreamLabels(): Promise<void> {
+    const stale = [...this.meta.entries()]
+      .filter(([, m]) => !m.label || m.label.startsWith("?"))
+      .slice(0, LABEL_FIX_MAX);
+    if (!stale.length) return;
+    const key = this.apiKey();
+    await this.mapLimit(stale, ENRICH_CONCURRENCY, LABEL_FIX_DEADLINE_MS, async ([id, m]) => {
+      const d = await this.fetchPoolDetail(m.chain, id, key);
+      const lbl = d ? this.labelFromDetail(d) : null;
+      if (lbl) {
+        const cur = this.meta.get(id);
+        if (cur) cur.label = lbl;
+      }
+    });
   }
 
   private capCandidates(): void {
