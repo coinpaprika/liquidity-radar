@@ -2,12 +2,12 @@
 //
 // Two tiers:
 //  1. REST scanner = candidate DISCOVERY (cheap, thousands of pools): every
-//     SCAN_INTERVAL the DO pages through small + recently-created pools on each
-//     chain via /networks/{chain}/pools/filter and ranks them by 24h VOLUME
-//     (turnover). It does NOT try to measure liquidity growth: liquidity_usd is a
-//     coarse aggregate that barely moves minute-to-minute (calibrated live), so a
-//     "rising" signal can't be read from it. Volume is live and trustworthy, and
-//     high-turnover young pools are the rug-prone set worth watching.
+//     SCAN_INTERVAL the DO cursor-pages through small + recently-created pools on
+//     each chain via /networks/{chain}/pools/search and ranks them by a rug-risk
+//     score (age x churn x thin-float x wash). It does NOT try to measure liquidity
+//     growth: liquidity_usd is a coarse aggregate that barely moves minute-to-minute
+//     (calibrated live), so a "rising" signal can't be read from it. Young,
+//     high-turnover pools are the rug-prone set worth a scarce stream slot.
 //  2. Reserve stream = the real signal (precious, ~74 pools on the free tier).
 //     Drains AND rises are both computed here, from real quote-valued reserves at
 //     block level. Stream slots are filled by PIN-THE-MOVERS + ROTATE-TO-DISCOVER:
@@ -51,7 +51,7 @@ export interface Env extends SinkEnv {
   DRAIN_CONFIRM_SECONDS?: string; // a drain must persist this long before sending (default 90)
   POST_ADDS?: string; // "1" to also post liquidity adds (default off)
   POOLS_PER_CHAIN?: string; // cold-start volume watchlist size per chain (default 37)
-  SCAN_PAGES?: string; // pools/filter pages scanned per chain each cycle (default 6 = 600 pools/chain)
+  SCAN_PAGES?: string; // pools/search pages (cursor hops) scanned per chain each cycle (100 pools/page)
   SCAN_INTERVAL_SECONDS?: string; // liquidity scan cadence (default 60; liquidity_usd refreshes ~20-30s)
   ENRICH_POOLS?: string; // key-gated: top-N candidates to deep-probe via getPoolDetails (default 24, 0 = off)
   DEXPAPRIKA_API_KEY?: string; // optional Pro/Enterprise key: lifts the stream cap 3->7 connections
@@ -102,13 +102,21 @@ const STREAM_REFRESH_MS = 5 * 60 * 1000; // rotate/re-point the stream at most t
 // Candidate enrichment (key-gated booster, runs on the scan cadence): deep-probe
 // the top rug-scored candidates via getPoolDetails to add short-window sell-skew
 // (sharpens selection) and a per-swap-fresh quote reserve (promotes movers to the
-// stream). Free tier ranks on the pools/filter score alone; no detail calls.
+// stream). Free tier ranks on the pools/search score alone; no detail calls.
 const ENRICH_TOP_N = 24; // top candidates to deep-probe each scan cycle
 const ENRICH_CONCURRENCY = 2; // bounded: 2 REST + up to 3 keyless stream conns + 1 spare <= Workers ~6 ceiling
 const ENRICH_FETCH_TIMEOUT_MS = 5_000; // per getPoolDetails call: a hung origin must never pin a worker
 const ENRICH_DEADLINE_MS = 20_000; // hard cap on the whole enrich pass, so it can't dominate the alarm
 const PROMOTE_MOVE_PCT = 0.15; // quote-reserve move between probes that promotes a pool to the stream
 const PROMOTE_TTL_MS = 4 * 60 * 1000; // a REST-promoted pin lasts this long (until the stream takes over)
+// Brand-new pools: /pools/search reports liquidity_usd=0 until the index backfills
+// TVL (~a week), but volume/txns are live from block one. A liquidity-filtered scan
+// therefore CAN'T see the freshest pools, which is exactly where rugs happen. So we
+// pull the newest high-volume pools and deep-probe the top few via getPoolDetails to
+// read their REAL liquidity before admitting them. Bounded so it can't storm REST.
+const FRESH_ENRICH_KEYED = 40; // top-volume fresh pools to probe per chain (keyed: no burst limit)
+const FRESH_ENRICH_FREE = 6; // free tier: tiny (REST is a burst limiter shared with the stream)
+const FRESH_DEADLINE_MS = 15_000; // hard cap on the fresh-pool enrichment pass
 // Intent classification of a CONFIRMED drain (defaults; env-overridable). We can't
 // know intent for sure, so this is a labelled inference from observable signals.
 const RUG_COMPLETENESS = 0.8; // pulled >= this fraction of the pool, token liquidity gone => "rug"
@@ -585,11 +593,15 @@ export class RadarDO {
   }
 
   // --- tier 1: candidate discovery ------------------------------------------
-  // Page through each chain's small + recently-created pools and record the
-  // latest snapshot (24h volume = the ranking key). Paced sequentially (REST is a
-  // burst limiter); Retry-After is honored with a backoff. This builds the
-  // rotation universe the stream draws from; it does NOT measure growth (that
-  // comes from the live stream, since REST liquidity_usd barely moves per minute).
+  // Build the rotation universe the stream draws from, ranked by a rug-risk score
+  // (age x churn x thin-float x wash), NOT raw volume. Two passes per chain, both
+  // over /pools/search (the /pools/filter and plain /pools endpoints were removed
+  // in the June-2026 API consolidation; search is cursor-paginated, not page=N):
+  //   1. LIQUID  - established rug-prone pools; real liquidity is in the index.
+  //   2. FRESH   - brand-new pools whose liquidity_usd the index reports as 0 until
+  //                it backfills TVL; deep-probed via getPoolDetails for real values.
+  // It does NOT measure growth (that comes from the live stream, since REST
+  // liquidity_usd barely moves per minute). Paced (REST is a burst limiter).
   private async scanCandidates(): Promise<void> {
     if (this.scanning) return;
     this.scanning = true;
@@ -598,7 +610,7 @@ export class RadarDO {
     const pages = envInt(this.env.SCAN_PAGES, key ? KEYED_SCAN_PAGES : DEFAULT_SCAN_PAGES);
     const spacing = key ? KEYED_PAGE_SPACING_MS : PAGE_SPACING_MS;
     const createdAfter = Math.floor((now - SCAN_AGE_DAYS * 86400_000) / 1000);
-    const seenIds = new Set<string>(); // dedupe a pool that lands on two pages this scan
+    const seenIds = new Set<string>(); // dedupe a pool seen across passes/pages this scan
     // Keyed: scan the pro REST host; if its WAF ever 403s this (worker) IP, fall
     // back to the free host mid-scan so discovery never breaks.
     let base = key ? "https://api-pro.dexpaprika.com" : "https://api.dexpaprika.com";
@@ -607,86 +619,154 @@ export class RadarDO {
       : { accept: "application/json" };
     let usingPro = !!key;
     let seen = 0;
-    try {
-      for (const chain of DYNAMIC_CHAINS) {
-        let retries = 0;
-        for (let page = 1; page <= pages; page++) {
-          const url =
-            `${base}/networks/${chain}/pools/filter` +
-            `?liquidity_usd_min=${SCAN_LIQ_MIN}&liquidity_usd_max=${SCAN_LIQ_MAX}` +
-            `&txns_24h_min=${SCAN_TXNS_MIN}&created_after=${createdAfter}` +
-            `&sort_by=created_at&sort_dir=desc&limit=100&page=${page}`;
-          let results: any[] = [];
-          try {
-            const r = await fetch(url, { headers });
-            if (usingPro && (r.status === 401 || r.status === 403)) {
-              this.note(`api-pro REST blocked from this host (${r.status}); falling back to free api`);
-              base = "https://api.dexpaprika.com";
-              headers = { accept: "application/json" };
-              usingPro = false;
-              page--; // retry this page on the free host
-              continue;
-            }
-            if (r.status === 429) {
-              if (retries >= MAX_429_RETRIES) {
-                this.note(`scan ${chain} still 429 after ${retries} retries; skipping rest of chain`);
-                break;
-              }
-              retries++;
-              const wait = Math.min(envInt(r.headers.get("retry-after") ?? undefined, 20), MAX_BACKOFF_S);
-              this.note(`scan ${chain} p${page} rate-limited, backing off ${wait}s`);
-              await sleep(wait * 1000);
-              page--; // retry this page
-              continue;
-            }
-            retries = 0; // any non-429 response clears the streak
-            if (!r.ok) break; // page past the end / transient: stop this chain
-            results = ((await r.json()) as { results?: any[] })?.results ?? [];
-          } catch (e) {
-            this.note(`scan ${chain} p${page}: ${String(e)}`);
-            break;
+    const freshRaw: { chain: string; p: any }[] = []; // fresh pools to enrich for real liquidity
+
+    // GET one /pools/search page: fall off api-pro on a WAF block, honor one
+    // Retry-After backoff, and LOG a non-OK status before giving up so a future
+    // endpoint removal can't fail silently the way /pools/filter did. Returns the
+    // page's results plus the next cursor ("" when there is no next page).
+    const getPage = async (chain: string, query: string, cursor: string, tag: string): Promise<{ results: any[]; next: string } | null> => {
+      let rl = 0; // 429 retries (bounded; one-time host fallback is separate and can't loop)
+      for (;;) {
+        const url = `${base}/networks/${chain}/pools/search?${query}&limit=100` + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+        let r: Response;
+        try {
+          r = await fetch(url, { headers });
+        } catch (e) {
+          this.note(`scan ${chain} ${tag}: ${String(e)}`);
+          return null;
+        }
+        if (usingPro && (r.status === 401 || r.status === 403)) {
+          this.note(`api-pro REST blocked from this host (${r.status}); falling back to free api`);
+          base = "https://api.dexpaprika.com";
+          headers = { accept: "application/json" };
+          usingPro = false; // flips off, so this branch can't loop
+          continue; // retry the same page on the free host
+        }
+        if (r.status === 429) {
+          if (rl++ >= MAX_429_RETRIES) {
+            this.note(`scan ${chain} ${tag} still 429 after ${rl} retries; skipping`);
+            return null;
           }
-          if (!results.length) break;
-          for (const p of results) {
-            const id = String(p.id ?? "");
-            const liq = Number(p.liquidity_usd);
-            const vol = Number(p.volume_usd_24h);
-            if (!id || !Number.isFinite(liq) || liq <= 0) continue;
-            if (seenIds.has(id)) continue; // count each pool once per scan
-            seenIds.add(id);
-            const { syms, dex, label } = this.poolLabel(p);
-            if (SKIP_DEX.test(dex)) continue;
-            if (this.isStablePair(syms)) continue;
-            const volUsd = Number.isFinite(vol) ? vol : 0;
-            const ageHours = this.ageHours(p.created_at);
-            const txns = Number(p.transactions) || 0;
-            const fdv = this.riskyFdv(p);
-            const prev = this.candidates.get(id);
-            this.candidates.set(id, {
-              label,
-              chain,
-              liqUsd: liq,
-              volUsd,
-              ageHours,
-              txns,
-              fdv,
-              score: rugScore({ ageHours, liqUsd: liq, volUsd, txns, fdv }),
-              // preserve the last enrichment so promotion can compare across cycles
-              reserveUsd: prev?.reserveUsd,
-              priceTime: prev?.priceTime,
-              t: now,
-            });
-            seen++;
-          }
-          await sleep(spacing);
+          const wait = Math.min(envInt(r.headers.get("retry-after") ?? undefined, 20), MAX_BACKOFF_S);
+          this.note(`scan ${chain} ${tag} rate-limited, backing off ${wait}s`);
+          await sleep(wait * 1000);
+          continue;
+        }
+        if (!r.ok) {
+          this.note(`scan ${chain} ${tag}: HTTP ${r.status}`); // visible, not swallowed
+          return null;
+        }
+        try {
+          const j = (await r.json()) as { results?: any[]; next_cursor?: string; has_next_page?: boolean };
+          return { results: j.results ?? [], next: j.has_next_page && j.next_cursor ? j.next_cursor : "" };
+        } catch (e) {
+          this.note(`scan ${chain} ${tag}: bad json ${String(e)}`);
+          return null;
         }
       }
+    };
+
+    try {
+      for (const chain of DYNAMIC_CHAINS) {
+        // PASS 1 - established, rug-prone pools: real liquidity is in the index.
+        let cursor = "";
+        for (let page = 0; page < pages; page++) {
+          const q = `liquidity_usd_min=${SCAN_LIQ_MIN}&liquidity_usd_max=${SCAN_LIQ_MAX}&txns_24h_min=${SCAN_TXNS_MIN}`;
+          const pg = await getPage(chain, q, cursor, `liquid p${page}`);
+          if (!pg || !pg.results.length) break;
+          for (const p of pg.results) {
+            const id = String(p.id ?? "");
+            const liq = Number(p.liquidity_usd);
+            if (!id || seenIds.has(id) || !Number.isFinite(liq) || liq <= 0) continue;
+            const { syms, dex, label } = this.poolLabel(p);
+            if (SKIP_DEX.test(dex) || this.isStablePair(syms)) continue;
+            seenIds.add(id);
+            this.storeCandidate(id, chain, label, liq, p, now);
+            seen++;
+          }
+          if (!pg.next) break;
+          cursor = pg.next;
+          await sleep(spacing);
+        }
+        // PASS 2 - collect brand-new pools (one page; the API sorts by 24h volume).
+        const fresh = await getPage(chain, `created_after=${createdAfter}&txns_24h_min=${SCAN_TXNS_MIN}`, "", "fresh");
+        if (fresh) {
+          for (const p of fresh.results) {
+            const id = String(p.id ?? "");
+            if (!id || seenIds.has(id) || this.candidates.has(id)) continue; // already known
+            const { syms, dex } = this.poolLabel(p);
+            if (SKIP_DEX.test(dex) || this.isStablePair(syms)) continue; // stable check is best-effort here (search rows carry no symbols); re-checked after enrichment
+            freshRaw.push({ chain, p });
+          }
+        }
+      }
+
+      // Deep-probe the highest-volume fresh pools to read their REAL liquidity, then
+      // admit the ones inside the scan's liquidity band. Bounded N + concurrency +
+      // deadline so it can't storm REST or starve the stream's connections.
+      const freshN = key ? FRESH_ENRICH_KEYED : FRESH_ENRICH_FREE;
+      const topFresh = freshRaw
+        .sort((a, b) => (Number(b.p.volume_usd_24h) || 0) - (Number(a.p.volume_usd_24h) || 0))
+        .slice(0, freshN);
+      await this.mapLimit(topFresh, ENRICH_CONCURRENCY, FRESH_DEADLINE_MS, async ({ chain, p }) => {
+        const id = String(p.id);
+        if (seenIds.has(id)) return;
+        const d = await this.fetchPoolDetail(chain, id, key);
+        if (!d) return;
+        const liq = Number(d.liquidity_usd);
+        if (!Number.isFinite(liq) || liq < SCAN_LIQ_MIN || liq > SCAN_LIQ_MAX) return; // outside our band
+        const dsyms = ((d.tokens ?? []) as any[]).map((t) => t?.symbol ?? "?").slice(0, 2);
+        const ddex = String(d.dex_name ?? d.dex_id ?? "?");
+        if (SKIP_DEX.test(ddex) || this.isStablePair(dsyms)) return;
+        seenIds.add(id);
+        const label = this.labelFromDetail(d) ?? this.poolLabel(p).label;
+        this.storeCandidate(id, chain, label, liq, p, now, d);
+        seen++;
+      });
     } finally {
       this.capCandidates();
       this.lastScanMs = Date.now();
       this.scanning = false;
     }
     if (seen) this.note(`scan ok: ${seen} candidates this cycle, ${this.candidates.size} in universe`);
+  }
+
+  // Build+store a Candidate from a /pools/search row, and optionally a
+  // getPoolDetails payload `d` (fresh pools) which carries real fdv, a quote-valued
+  // reserve, short-window sell-skew, and a proper pair label the search row lacks.
+  private storeCandidate(id: string, chain: string, label: string, liq: number, p: any, now: number, d?: any): void {
+    const vol = Number(p.volume_usd_24h);
+    const volUsd = Number.isFinite(vol) ? vol : 0;
+    const ageHours = this.ageHours(p.created_at ?? d?.created_at);
+    const txns = Number(p.transactions_24h) || 0;
+    const fdv = d ? this.riskyFdv(d) : this.riskyFdv(p);
+    const sellSkew = d ? this.shortSellSkew(d) : undefined;
+    const reserveUsd = d ? this.quoteReserveOf(d.token_reserves) : NaN;
+    const priceTime = d ? Date.parse(String(d.price_time ?? "")) / 1000 : NaN;
+    const prev = this.candidates.get(id);
+    this.candidates.set(id, {
+      label,
+      chain,
+      liqUsd: liq,
+      volUsd,
+      ageHours,
+      txns,
+      fdv,
+      score: rugScore({ ageHours, liqUsd: liq, volUsd, txns, fdv, sellSkew }),
+      // preserve the last enrichment so promotion can compare across cycles
+      reserveUsd: Number.isFinite(reserveUsd) ? reserveUsd : prev?.reserveUsd,
+      priceTime: Number.isFinite(priceTime) ? priceTime : prev?.priceTime,
+      t: now,
+    });
+  }
+
+  // Real pair label from a getPoolDetails payload (its tokens[] carry symbols;
+  // /pools/search rows don't, so discovered candidates read "?/?" until enriched).
+  private labelFromDetail(d: any): string | null {
+    const syms = ((d?.tokens ?? []) as any[]).map((t) => t?.symbol).filter(Boolean).slice(0, 2);
+    if (syms.length < 2) return null;
+    return `${syms.join("/")} (${String(d?.dex_name ?? d?.dex_id ?? "?")})`;
   }
 
   private capCandidates(): void {
@@ -701,7 +781,7 @@ export class RadarDO {
   // reserve and PROMOTE pools whose reserve just moved sharply onto the stream
   // (a wide REST pre-filter the 74 slots can't cover by rotation alone). Bounded
   // N and concurrency so it never starves the alarm or the stream's connections.
-  // Free tier (no key) skips this entirely and ranks on the pools/filter score.
+  // Free tier (no key) skips this entirely and ranks on the pools/search score.
   private async enrichTopCandidates(): Promise<void> {
     const key = this.apiKey();
     if (!key) return;
@@ -728,9 +808,12 @@ export class RadarDO {
         this.promoted.set(id, { chain: c.chain, label: c.label, t: Date.now() });
         promotedNow++;
       }
-      // P2: fold sell-skew into the score; persist the fresh reserve for next cycle.
-      const score = rugScore({ ageHours: c.ageHours, liqUsd: c.liqUsd, volUsd: c.volUsd, txns: c.txns, fdv: c.fdv, sellSkew });
-      this.candidates.set(id, { ...c, score, reserveUsd: Number.isFinite(reserveUsd) ? reserveUsd : c.reserveUsd, priceTime: Number.isFinite(priceTime) ? priceTime : c.priceTime, t: c.t });
+      // P2: fold sell-skew into the score; backfill the real label/fdv the search
+      // row lacked; persist the fresh reserve for next cycle.
+      const label = this.labelFromDetail(d) ?? c.label;
+      const fdv = this.riskyFdv(d) || c.fdv;
+      const score = rugScore({ ageHours: c.ageHours, liqUsd: c.liqUsd, volUsd: c.volUsd, txns: c.txns, fdv, sellSkew });
+      this.candidates.set(id, { ...c, label, fdv, score, reserveUsd: Number.isFinite(reserveUsd) ? reserveUsd : c.reserveUsd, priceTime: Number.isFinite(priceTime) ? priceTime : c.priceTime, t: c.t });
     });
     // expire stale promotions (the stream's own pinning takes over once it sees the move)
     for (const [id, m] of this.promoted) if (Date.now() - m.t > PROMOTE_TTL_MS) this.promoted.delete(id);
@@ -761,11 +844,13 @@ export class RadarDO {
   // once on the free host so enrichment still works from worker IPs. Each call is
   // hard-bounded by a timeout: a hung origin must never pin an enrich worker and
   // stall the alarm (and with it the stream watchdog).
-  private async fetchPoolDetail(chain: string, id: string, key: string): Promise<any | null> {
-    const hosts: [string, Record<string, string>][] = [
-      ["https://api-pro.dexpaprika.com", { accept: "application/json", authorization: key }],
-      ["https://api.dexpaprika.com", { accept: "application/json" }],
-    ];
+  private async fetchPoolDetail(chain: string, id: string, key?: string): Promise<any | null> {
+    const hosts: [string, Record<string, string>][] = key
+      ? [
+          ["https://api-pro.dexpaprika.com", { accept: "application/json", authorization: key }],
+          ["https://api.dexpaprika.com", { accept: "application/json" }],
+        ]
+      : [["https://api.dexpaprika.com", { accept: "application/json" }]];
     for (const [base, headers] of hosts) {
       try {
         const r = await fetch(`${base}/networks/${chain}/pools/${id}`, {
@@ -957,20 +1042,23 @@ export class RadarDO {
     const out: WatchEntry[] = [];
     for (const chain of DYNAMIC_CHAINS) {
       let kept = 0;
-      for (const page of [0, 1]) {
-        if (kept >= perChain) break;
-        let pools: any[] = [];
+      let cursor = ""; // /pools/search is cursor-paginated (page=N is ignored); it defaults to order_by=volume_usd_24h, which is what a cold-start list wants
+      for (let page = 0; page < 2 && kept < perChain; page++) {
+        let j: { results?: any[]; next_cursor?: string; has_next_page?: boolean };
         try {
-          const r = await fetch(
-            `https://api.dexpaprika.com/networks/${chain}/pools?page=${page}&limit=100&order_by=volume_usd&sort=desc`,
-            { headers: { accept: "application/json" } },
-          );
-          if (!r.ok) continue;
-          pools = ((await r.json()) as { pools?: any[] })?.pools ?? [];
+          const url = `https://api.dexpaprika.com/networks/${chain}/pools/search?limit=100` + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+          const r = await fetch(url, { headers: { accept: "application/json" } });
+          if (!r.ok) {
+            this.note(`watchlist refresh ${chain} p${page}: HTTP ${r.status}`);
+            break;
+          }
+          j = await r.json();
         } catch (e) {
           this.note(`watchlist refresh ${chain} p${page}: ${String(e)}`);
-          continue;
+          break;
         }
+        const pools = j.results ?? [];
+        if (!pools.length) break;
         for (const p of pools) {
           if (kept >= perChain) break;
           const { syms, dex, label } = this.poolLabel(p);
@@ -979,6 +1067,8 @@ export class RadarDO {
           out.push({ method: "pool_reserves", chain, address: p.id, label });
           kept++;
         }
+        if (!j.has_next_page || !j.next_cursor) break;
+        cursor = j.next_cursor;
       }
     }
     if (out.length < 20) {
@@ -1019,8 +1109,15 @@ export class RadarDO {
       const drainAmt = Math.abs(p.alert.deltaUsd);
       const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
       if (stillDrained) {
+        // Cumulative fraction of the pool gone from the pre-drain baseline to the
+        // reserve now (both known here). This, not a single frozen stream event's
+        // pct, is what tells a full rug from a partial exit. undefined when we have
+        // no current reserve -> classifyDrain must not guess "rug".
+        const completeness = cur === undefined || !(p.prevReserveUsd > 0)
+          ? undefined
+          : Math.min(Math.max(0, (p.prevReserveUsd - cur) / p.prevReserveUsd), 1);
         // bound confirm-time lookups per cycle; a burst commits as "unknown" rather than stalling the alarm
-        const intent = classified < CLASSIFY_MAX_PER_CYCLE ? await this.classifyDrain(p.alert) : "unknown";
+        const intent = classified < CLASSIFY_MAX_PER_CYCLE ? await this.classifyDrain(p.alert, completeness) : "unknown";
         classified++;
         await this.commit(p.alert, intent);
       } else {
@@ -1092,10 +1189,14 @@ export class RadarDO {
   // to another pool (migration)? `summary.liquidity_usd` from getTokenDetails is
   // the token's TOTAL liquidity across all its pools; subtracting this gutted
   // pool's residual leaves what lives elsewhere.
-  private async classifyDrain(alert: Alert): Promise<DrainIntent> {
+  private async classifyDrain(alert: Alert, completeness?: number): Promise<DrainIntent> {
     const rugC = envFloat(this.env.RUG_COMPLETENESS, RUG_COMPLETENESS);
     const migMin = envInt(this.env.MIGRATION_MIN_USD, MIGRATION_MIN_USD);
-    const completeness = Math.min(Math.abs(alert.pct) || 0, 1);
+    // cumulative fraction of the pool drained (from resolvePending's baseline-to-now
+    // reserve); undefined = current reserve unknown, so completeness can't be judged.
+    const comp = typeof completeness === "number" && Number.isFinite(completeness)
+      ? Math.min(Math.max(0, completeness), 1)
+      : undefined;
     const token = this.meta.get(alert.subject)?.token;
     if (token) {
       const tokenLiq = await this.fetchTokenLiquidity(alert.chain, token);
@@ -1104,7 +1205,8 @@ export class RadarDO {
         if (otherLiq >= Math.max(migMin, alert.prevReserveUsd)) return "migration";
       }
     }
-    return completeness >= rugC ? "rug" : "exit";
+    if (comp === undefined) return "unknown"; // no clear migration and completeness unknown: don't guess "rug"
+    return comp >= rugC ? "rug" : "exit";
   }
 
   private intentLabel(intent: DrainIntent): string {
