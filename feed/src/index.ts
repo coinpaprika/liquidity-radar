@@ -34,6 +34,7 @@ import {
   type WatchEntry,
 } from "../../core/src/index.js";
 import { isLive, postAlert, type SinkEnv } from "./webhook.js";
+import { pathSegment, redact } from "./safe.js";
 import { LANDING_HTML } from "./page.js";
 import { RADAR_HTML } from "./radar.js";
 import bundledWatchlist from "../../watchlist.json";
@@ -56,8 +57,7 @@ export interface Env extends SinkEnv {
   ENRICH_POOLS?: string; // key-gated: top-N candidates to deep-probe via getPoolDetails (default 24, 0 = off)
   DEXPAPRIKA_API_KEY?: string; // optional Pro/Enterprise key: lifts the stream cap 3->7 connections
   STREAM_MAX_AGE_SECONDS?: string; // proactively recycle the subscription this often (default 600)
-  STREAM_KEYLESS?: string; // "1": don't send the key on the STREAM (scanner still keyed). For Cloudflare
-  // Workers, where the keyed SSE delivers pings but no data (WAF on keyed stream from worker IPs).
+  STREAM_KEYLESS?: string; // "1": don't send the key on the STREAM (scanner still keyed); see wrangler.toml
 }
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000;
@@ -257,11 +257,14 @@ export default {
     if (!["/", "/radar", "/api/live", "/status"].includes(url.pathname)) {
       return new Response("not found", { status: 404 });
     }
+    // Every route ignores the query string, so the cache key does too: a query
+    // must not turn the short public cache into a miss that wakes the radar.
+    const cacheKey = new Request(`${url.origin}${url.pathname}`);
     const cache = caches.default;
-    const cached = await cache.match(req);
+    const cached = await cache.match(cacheKey);
     if (cached) return cached;
     const res = await env.RADAR.get(env.RADAR.idFromName("singleton")).fetch(req);
-    if (res.ok) ctx.waitUntil(cache.put(req, res.clone()));
+    if (res.ok) ctx.waitUntil(cache.put(cacheKey, res.clone()));
     return res;
   },
 
@@ -463,7 +466,7 @@ export class RadarDO {
         },
         onError: (err, entries) => {
           this.streamErrCount++;
-          this.lastStreamErr = `${String(err).slice(0, 150)} (${entries.length}p)`;
+          this.lastStreamErr = `${this.redact(String(err)).slice(0, 150)} (${entries.length}p)`;
           const now = Date.now();
           if (now - this.lastErrNoteMs > 60_000) {
             this.lastErrNoteMs = now;
@@ -506,9 +509,12 @@ export class RadarDO {
     const k = this.env.DEXPAPRIKA_API_KEY?.trim();
     return k ? k : undefined;
   }
+  // Status-page text with the key and the webhook URL removed.
+  private redact(text: string): string {
+    return redact(text, [this.apiKey(), this.env.WEBHOOK_URL?.trim()]);
+  }
   // The key used FOR THE STREAM specifically. STREAM_KEYLESS forces the free
-  // stream (the scanner keeps the full key) because keyed SSE from a Cloudflare
-  // Worker IP currently delivers pings but no data.
+  // stream (the scanner keeps the full key); see wrangler.toml.
   private streamKey(): string | undefined {
     return this.env.STREAM_KEYLESS === "1" ? undefined : this.apiKey();
   }
@@ -611,8 +617,8 @@ export class RadarDO {
     const spacing = key ? KEYED_PAGE_SPACING_MS : PAGE_SPACING_MS;
     const createdAfter = Math.floor((now - SCAN_AGE_DAYS * 86400_000) / 1000);
     const seenIds = new Set<string>(); // dedupe a pool seen across passes/pages this scan
-    // Keyed: scan the pro REST host; if its WAF ever 403s this (worker) IP, fall
-    // back to the free host mid-scan so discovery never breaks.
+    // Keyed: scan the pro REST host; if it ever answers 401/403, fall back to
+    // the free host mid-scan so discovery never breaks.
     let base = key ? "https://api-pro.dexpaprika.com" : "https://api.dexpaprika.com";
     let headers: Record<string, string> = key
       ? { accept: "application/json", authorization: key }
@@ -621,7 +627,7 @@ export class RadarDO {
     let seen = 0;
     const freshRaw: { chain: string; p: any }[] = []; // fresh pools to enrich for real liquidity
 
-    // GET one /pools/search page: fall off api-pro on a WAF block, honor one
+    // GET one /pools/search page: fall off api-pro on a 401/403, honor one
     // Retry-After backoff, and LOG a non-OK status before giving up so a future
     // endpoint removal can't fail silently the way /pools/filter did. Returns the
     // page's results plus the next cursor ("" when there is no next page).
@@ -637,7 +643,7 @@ export class RadarDO {
           return null;
         }
         if (usingPro && (r.status === 401 || r.status === 403)) {
-          this.note(`api-pro REST blocked from this host (${r.status}); falling back to free api`);
+          this.note(`api-pro answered ${r.status}; scanning the free host`);
           base = "https://api.dexpaprika.com";
           headers = { accept: "application/json" };
           usingPro = false; // flips off, so this branch can't loop
@@ -840,11 +846,14 @@ export class RadarDO {
     await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   }
 
-  // getPoolDetails with the key on api-pro; on a WAF 401/403 from this host, retry
-  // once on the free host so enrichment still works from worker IPs. Each call is
+  // getPoolDetails with the key on api-pro; on a 401/403, retry once on the free
+  // host so enrichment keeps working. The id comes from an API response, so it
+  // must stay one path segment before the key goes with it. Each call is
   // hard-bounded by a timeout: a hung origin must never pin an enrich worker and
   // stall the alarm (and with it the stream watchdog).
   private async fetchPoolDetail(chain: string, id: string, key?: string): Promise<any | null> {
+    const seg = pathSegment(id);
+    if (!seg) return null;
     const hosts: [string, Record<string, string>][] = key
       ? [
           ["https://api-pro.dexpaprika.com", { accept: "application/json", authorization: key }],
@@ -853,7 +862,7 @@ export class RadarDO {
       : [["https://api.dexpaprika.com", { accept: "application/json" }]];
     for (const [base, headers] of hosts) {
       try {
-        const r = await fetch(`${base}/networks/${chain}/pools/${id}`, {
+        const r = await fetch(`${base}/networks/${chain}/pools/${seg}`, {
           headers,
           signal: AbortSignal.timeout(ENRICH_FETCH_TIMEOUT_MS),
         });
@@ -1222,13 +1231,15 @@ export class RadarDO {
   // Token-level total liquidity (getTokenDetails.summary.liquidity_usd), timeout-
   // bounded, key on api-pro with a free-host fallback. null if it can't be read.
   private async fetchTokenLiquidity(chain: string, token: string): Promise<number | null> {
+    const seg = pathSegment(token);
+    if (!seg) return null;
     const key = this.apiKey();
     const hosts: [string, Record<string, string>][] = key
       ? [["https://api-pro.dexpaprika.com", { accept: "application/json", authorization: key }], ["https://api.dexpaprika.com", { accept: "application/json" }]]
       : [["https://api.dexpaprika.com", { accept: "application/json" }]];
     for (const [base, headers] of hosts) {
       try {
-        const r = await fetch(`${base}/networks/${chain}/tokens/${token}`, { headers, signal: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS) });
+        const r = await fetch(`${base}/networks/${chain}/tokens/${seg}`, { headers, signal: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS) });
         if (r.status === 401 || r.status === 403) continue;
         if (!r.ok) return null;
         const d = (await r.json()) as any;
@@ -1354,7 +1365,7 @@ export class RadarDO {
     const live = isLive(this.env);
     const mode = live ? "live, sending drains to webhook" : "watch-only (no WEBHOOK_URL)";
     const keyMode = this.apiKey()
-      ? `Pro key: scanner keyed${this.streamKey() ? ", stream keyed (cap 7)" : ", stream KEYLESS (cap 3; keyed SSE blocked from worker IPs)"}`
+      ? `Pro key: scanner keyed${this.streamKey() ? ", stream keyed (cap 7)" : ", stream keyless (cap 3)"}`
       : "free tier (stream cap 3 connections)";
     const lastEvent = this.lastEventMs > 0 ? `${Math.round((now - this.lastEventMs) / 1000)}s ago` : "none yet";
     const lastRaw = this.lastRawMsgMs > 0 ? `${Math.round((now - this.lastRawMsgMs) / 1000)}s ago` : "none yet";
@@ -1366,9 +1377,9 @@ export class RadarDO {
       : "no drains yet";
     const paused = now < gate.pausedUntilMs
       ? `<p><strong>sending paused until ${escapeHtml(new Date(gate.pausedUntilMs).toISOString())}</strong></p>` : "";
-    const postError = gate.lastPostError ? `<p>last send error: <code>${escapeHtml(gate.lastPostError)}</code></p>` : "";
+    const postError = gate.lastPostError ? `<p>last send error: <code>${escapeHtml(this.redact(gate.lastPostError))}</code></p>` : "";
     const issues = this.issues.length
-      ? `<h2>Recent issues</h2><ul>${this.issues.map((i) => `<li><code>${escapeHtml(i)}</code></li>`).join("")}</ul>` : "";
+      ? `<h2>Recent issues</h2><ul>${this.issues.map((i) => `<li><code>${escapeHtml(this.redact(i))}</code></li>`).join("")}</ul>` : "";
     const rows = recent
       .map((r) => {
         const a = r.alert;
@@ -1388,7 +1399,7 @@ export class RadarDO {
 <h1>LiquidityRadar status</h1>
 <p>mode: <strong>${escapeHtml(mode)}</strong> · ${escapeHtml(keyMode)}<br>
 stream: ${escapeHtml(this.configSource)}<br>
-stream health: ${this.streamStarts} starts · ${this.streamErrCount} errors${this.lastStreamErr ? ` · last err: <code>${escapeHtml(this.lastStreamErr)}</code>` : ""}<br>
+stream health: ${this.streamStarts} starts · ${this.streamErrCount} errors${this.lastStreamErr ? ` · last err: <code>${escapeHtml(this.redact(this.lastStreamErr))}</code>` : ""}<br>
 scanner: ${this.candidates.size} candidates discovered (ranked by rug-risk score) · last scan ${escapeHtml(lastScan)}<br>
 ${this.lastEnrich ? `enrichment: ${escapeHtml(this.lastEnrich)}<br>` : ""}${escapeHtml(this.thresholds)}<br>last raw msg incl ping: ${escapeHtml(lastRaw)} · last reserve event: ${escapeHtml(lastEvent)} · last sent: ${escapeHtml(lastPost)}<br>
 <strong>${escapeHtml(totals)}</strong></p>
