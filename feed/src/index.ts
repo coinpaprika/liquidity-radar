@@ -296,7 +296,10 @@ export class RadarDO {
   private thresholds = "";
   private issues: string[] = [];
   private lastReserve = new Map<string, number>();
+  // Drains awaiting confirmation. Mirrored to storage under "pending" so an
+  // eviction or redeploy inside the confirm window does not silently drop one.
   private pending = new Map<string, Pending>();
+  private pendingLoaded = false;
   private series = new Map<string, { t: number; r: number }[]>();
   private meta = new Map<string, { label: string; chain: string; token?: string }>();
   private candidates = new Map<string, Candidate>(); // discovered pools (rotation universe)
@@ -405,7 +408,7 @@ export class RadarDO {
     if (v !== SCHEMA_VERSION) {
       await this.state.storage.delete([
         "recent", "stats", "hyp_rw", "hyp_dr", "streamWatchlist", "dynamicWatchlist",
-        "scan_rising", "scan_rugwatch", "rising_snapshot",
+        "scan_rising", "scan_rugwatch", "rising_snapshot", "pending",
       ]);
       await this.state.storage.put("schema", SCHEMA_VERSION);
       this.note(`purged stale state (schema ${v ?? "none"} -> ${SCHEMA_VERSION})`);
@@ -414,6 +417,7 @@ export class RadarDO {
 
   private async ensureRunning(): Promise<void> {
     await this.purgeIfStale();
+    await this.loadPending();
     if ((await this.state.storage.getAlarm()) === null) {
       await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     }
@@ -1098,41 +1102,68 @@ export class RadarDO {
       if (this.env.POST_ADDS === "1") await this.commit(alert);
       return;
     }
+    await this.loadPending();
     if (!this.pending.has(alert.subject)) {
       this.pending.set(alert.subject, { alert, prevReserveUsd: alert.prevReserveUsd, atMs: Date.now() });
+      await this.savePending();
     }
   }
 
+  // Restore drains held by a previous instance. Entries this instance already
+  // holds win; the stored copy only fills the gaps.
+  private async loadPending(): Promise<void> {
+    if (this.pendingLoaded) return;
+    const stored = (await this.state.storage.get<Record<string, Pending>>("pending")) ?? {};
+    this.pendingLoaded = true;
+    for (const [subject, p] of Object.entries(stored)) {
+      if (!this.pending.has(subject)) this.pending.set(subject, p);
+    }
+  }
+
+  private async savePending(): Promise<void> {
+    if (this.pending.size === 0) await this.state.storage.delete("pending");
+    else await this.state.storage.put("pending", Object.fromEntries(this.pending));
+  }
+
   private async resolvePending(): Promise<void> {
+    await this.loadPending();
     const now = Date.now();
     const confirmMs = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90) * 1000;
     let classified = 0;
-    for (const [subject, p] of [...this.pending]) {
-      if (now - p.atMs < confirmMs) continue;
-      this.pending.delete(subject);
-      const cur = this.lastReserve.get(subject);
-      // "Held" = the reserve has not refilled most of the drained amount. Measured
-      // against the DRAIN itself, not an absolute fraction of the pre-drain size,
-      // so a small drain ($250 off a $10k pool) confirms when it sticks, instead
-      // of being wrongly suppressed for not having halved the whole pool.
-      const drainAmt = Math.abs(p.alert.deltaUsd);
-      const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
-      if (stillDrained) {
-        // Cumulative fraction of the pool gone from the pre-drain baseline to the
-        // reserve now (both known here). This, not a single frozen stream event's
-        // pct, is what tells a full rug from a partial exit. undefined when we have
-        // no current reserve -> classifyDrain must not guess "rug".
-        const completeness = cur === undefined || !(p.prevReserveUsd > 0)
-          ? undefined
-          : Math.min(Math.max(0, (p.prevReserveUsd - cur) / p.prevReserveUsd), 1);
-        // bound confirm-time lookups per cycle; a burst commits as "unknown" rather than stalling the alarm
-        const intent = classified < CLASSIFY_MAX_PER_CYCLE ? await this.classifyDrain(p.alert, completeness) : "unknown";
-        classified++;
-        await this.commit(p.alert, intent);
-      } else {
-        await this.record(p.alert, false, "suppressed: refilled");
-        await this.bumpStats({ drains: 1, suppressed: 1 });
+    let resolved = false;
+    try {
+      for (const [subject, p] of [...this.pending]) {
+        if (now - p.atMs < confirmMs) continue;
+        this.pending.delete(subject);
+        resolved = true;
+        const cur = this.lastReserve.get(subject);
+        // "Held" = the reserve has not refilled most of the drained amount. Measured
+        // against the DRAIN itself, not an absolute fraction of the pre-drain size,
+        // so a small drain ($250 off a $10k pool) confirms when it sticks, instead
+        // of being wrongly suppressed for not having halved the whole pool.
+        const drainAmt = Math.abs(p.alert.deltaUsd);
+        const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
+        if (stillDrained) {
+          // Cumulative fraction of the pool gone from the pre-drain baseline to the
+          // reserve now (both known here). This, not a single frozen stream event's
+          // pct, is what tells a full rug from a partial exit. undefined when we have
+          // no current reserve -> classifyDrain must not guess "rug".
+          const completeness = cur === undefined || !(p.prevReserveUsd > 0)
+            ? undefined
+            : Math.min(Math.max(0, (p.prevReserveUsd - cur) / p.prevReserveUsd), 1);
+          // bound confirm-time lookups per cycle; a burst commits as "unknown" rather than stalling the alarm
+          const intent = classified < CLASSIFY_MAX_PER_CYCLE ? await this.classifyDrain(p.alert, completeness) : "unknown";
+          classified++;
+          await this.commit(p.alert, intent);
+        } else {
+          await this.record(p.alert, false, "suppressed: refilled");
+          await this.bumpStats({ drains: 1, suppressed: 1 });
+        }
       }
+    } finally {
+      // Saved after the commits: an eviction mid-loop replays the entry, and the
+      // gate's per-block dedup key keeps a replay from posting twice.
+      if (resolved) await this.savePending();
     }
   }
 
