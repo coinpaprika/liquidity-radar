@@ -1,6 +1,6 @@
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
-import { RadarDO } from "../../feed/src/index.js";
+import worker, { RadarDO } from "../../feed/src/index.js";
 import type { Alert } from "../src/types.js";
 
 // Durable Object storage stand-in: one Map shared by every instance built on
@@ -63,5 +63,45 @@ test("a drain held by an evicted instance is still confirmed by the next one", a
     assert.equal(state.storage.data.has("pending"), false, "a resolved drain leaves the hold");
   } finally {
     now.mock.restore();
+  }
+});
+
+test("the public cache ignores the query string, so cache-busting cannot reach the radar", async () => {
+  const store = new Map<string, Response>();
+  const g = globalThis as any;
+  const prev = g.caches;
+  g.caches = {
+    default: {
+      async match(r: Request) {
+        return store.get(r.url)?.clone();
+      },
+      async put(r: Request, res: Response) {
+        store.set(r.url, res);
+      },
+    },
+  };
+  let radarHits = 0;
+  const env = {
+    RADAR: {
+      idFromName: () => "singleton",
+      get: () => ({
+        fetch: async () => {
+          radarHits++;
+          return new Response("{}", { headers: { "content-type": "application/json" } });
+        },
+      }),
+    },
+  } as any;
+  const pendingPuts: Promise<unknown>[] = [];
+  const ctx = { waitUntil: (p: Promise<unknown>) => pendingPuts.push(p) } as any;
+  try {
+    for (const q of ["", "?x=1", "?x=2", "?cb=" + "z".repeat(40)]) {
+      const res = await worker.fetch(new Request(`https://radar.example/api/live${q}`), env, ctx);
+      assert.equal(res.status, 200);
+      await Promise.all(pendingPuts);
+    }
+    assert.equal(radarHits, 1, "only the first request may wake the radar");
+  } finally {
+    g.caches = prev;
   }
 });
