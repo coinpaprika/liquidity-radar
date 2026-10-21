@@ -36,9 +36,9 @@ export interface StreamOptions {
   baseUrl?: string;
   signal?: AbortSignal;
   /**
-   * Optional DexPaprika API key. Sent as the bare `Authorization` header (no
-   * "Bearer" prefix, which trips the WAF). Lifts the per-IP stream limit from
-   * 3 concurrent connections to 7. Without it, the free keyless tier is used.
+   * Optional DexPaprika API key, sent as the `Authorization` header, the key
+   * on its own. Lifts the per-IP stream limit from 3 concurrent connections
+   * to 7. Without it, the free keyless tier is used.
    */
   apiKey?: string;
   /** Transient connection errors; the stream retries with backoff after each. */
