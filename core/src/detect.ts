@@ -37,36 +37,56 @@ function isQuote(tokenId: string): boolean {
 }
 
 /**
+ * How much of the quote-leg loss a non-quote gain must cover before we read
+ * the event as a sell-swap instead of a drain. A real swap roughly conserves
+ * value: what leaves the quote leg shows up on the other leg (the sell-swap
+ * fixture is -20,000 / +22,000). Half leaves room for fees, price impact and
+ * the meme leg's noisy pricing, while a drain padded with a token-sized buy in
+ * the same block window (-200,000 / +1) still alerts. The meme leg is priced
+ * off its own pool, so this narrows the gap rather than closing it.
+ */
+export const SWAP_OFFSET_RATIO = 0.5;
+
+/**
  * Value a pool by its quote leg(s): the real USD on the SOL/USDC/USDT side,
  * not the meme leg's inflated notional. `quoted` is false when neither leg is a
  * known quote token (meme/meme pair); then we fall back to the pool total,
- * which can't be trusted, so callers may choose to ignore it. `nonQuoteRose`
- * flags that a non-quote leg increased, which (with the quote leg falling) means
- * a sell-swap, not a liquidity removal.
+ * which can't be trusted, so callers may choose to ignore it. `nonQuoteGainUsd`
+ * sums the USD gained by non-quote legs (`nonQuoteRose` is just whether it is
+ * above zero); a falling quote leg offset by a comparable gain is a sell-swap,
+ * not a liquidity removal.
  */
 export function poolQuoteUsd(event: PoolReserveEvent): {
   reserveUsd: number;
   deltaUsd: number;
   quoted: boolean;
   nonQuoteRose: boolean;
+  nonQuoteGainUsd: number;
 } {
   let reserveUsd = 0;
   let deltaUsd = 0;
   let quoted = false;
-  let nonQuoteRose = false;
+  let nonQuoteGainUsd = 0;
   for (const leg of event.tokens) {
     if (isQuote(leg.token_id)) {
       reserveUsd += leg.reserve_usd;
       deltaUsd += leg.delta_usd;
       quoted = true;
     } else if (leg.delta_usd > 0) {
-      nonQuoteRose = true;
+      nonQuoteGainUsd += leg.delta_usd;
     }
   }
+  const nonQuoteRose = nonQuoteGainUsd > 0;
   if (!quoted) {
-    return { reserveUsd: event.total_reserve_usd, deltaUsd: event.total_delta_usd, quoted: false, nonQuoteRose };
+    return {
+      reserveUsd: event.total_reserve_usd,
+      deltaUsd: event.total_delta_usd,
+      quoted: false,
+      nonQuoteRose,
+      nonQuoteGainUsd,
+    };
   }
-  return { reserveUsd, deltaUsd, quoted, nonQuoteRose };
+  return { reserveUsd, deltaUsd, quoted, nonQuoteRose, nonQuoteGainUsd };
 }
 
 /** Real, quote-valued reserve for a pool event (for charts/series). */
@@ -79,8 +99,9 @@ export function poolReserveUsd(event: PoolReserveEvent): number {
  *
  * Pools are valued by their quote leg (SOL/USDC/USDT), so the USD figures are
  * the real money, not a meme token's inflated notional. A drain is a liquidity
- * removal: the quote leg falls AND no non-quote leg rises (a sell-swap pulls
- * the quote leg down too, but pushes the meme leg up, which is not a drain).
+ * removal: the quote leg falls AND no non-quote leg rises by enough to offset
+ * it (a sell-swap pulls the quote leg down too, but pushes the meme leg up by a
+ * comparable amount, which is not a drain; see SWAP_OFFSET_RATIO).
  */
 export function detect(
   event: ReserveEvent,
@@ -91,7 +112,7 @@ export function detect(
   let subject: string;
   let reserveUsd: number;
   let deltaUsd: number;
-  let nonQuoteRose = false;
+  let nonQuoteGainUsd = 0;
 
   if (event.type === "token_reserves") {
     scope = "token";
@@ -104,7 +125,7 @@ export function detect(
     const q = poolQuoteUsd(event);
     reserveUsd = q.reserveUsd;
     deltaUsd = q.deltaUsd;
-    nonQuoteRose = q.nonQuoteRose;
+    nonQuoteGainUsd = q.nonQuoteGainUsd;
   }
 
   if (Math.abs(deltaUsd) < cfg.minUsd) return null;
@@ -116,8 +137,9 @@ export function detect(
   if (Math.abs(pct) < cfg.pctThreshold) return null;
 
   const kind = deltaUsd < 0 ? "drain" : "add";
-  // A falling quote leg while a meme leg rises is a sell-swap, not a drain.
-  if (kind === "drain" && nonQuoteRose) return null;
+  // A falling quote leg while a meme leg rises by a comparable amount is a
+  // sell-swap, not a drain. A token-sized gain does not veto a large loss.
+  if (kind === "drain" && nonQuoteGainUsd >= SWAP_OFFSET_RATIO * Math.abs(deltaUsd)) return null;
 
   return {
     kind,

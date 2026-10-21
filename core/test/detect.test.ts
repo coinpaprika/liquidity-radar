@@ -173,6 +173,34 @@ test("a sell-swap (quote down, meme up) is not a drain", () => {
   assert.equal(a, null);
 });
 
+test("a drain padded with a token-sized meme-leg gain still alerts", () => {
+  // Pool owner pulls 200k of USDC and buys $1 of the meme token in the same
+  // window. The +1 must not read as a sell-swap.
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      total_reserve_usd: 20_001,
+      total_delta_usd: -199_999,
+      tokens: [leg("MEMEpump", 1, +1), leg(USDC_SOL, 20_000, -200_000)],
+    }),
+    DEFAULT_DETECT,
+  );
+  assert.ok(a);
+  assert.equal(a.kind, "drain");
+  assert.equal(a.deltaUsd, -200_000);
+});
+
+test("an ordinary sell-swap at default thresholds is not a drain", () => {
+  const a = detect(
+    poolEvent({
+      chain: "solana",
+      tokens: [leg("MEMEpump", 230_000, +95_000), leg(USDC_SOL, 100_000, -100_000)],
+    }),
+    DEFAULT_DETECT,
+  );
+  assert.equal(a, null);
+});
+
 test("meme/meme pool with no quote leg falls back to the pool total", () => {
   const a = detect(
     poolEvent({
