@@ -23,6 +23,7 @@ import {
   DATA_CREDIT,
   createRadar,
   formatAlert,
+  isCallerError,
   poolReserveUsd,
   rugScore,
   QUOTE_TOKENS,
@@ -132,6 +133,12 @@ const STREAM_RISE_THRESHOLD = 0.05; // >=5% real reserve growth over the window 
 const PIN_MOVE_THRESHOLD = 0.05;
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
 const SILENCE_RESTART_MS = 150_000; // restart the subscription if it delivers NOTHING this long
+// A pool the stream rejected is kept off the watchlist this long, so a recycle
+// doesn't resubscribe it straight back into a shared connection. Bounded in
+// time and count: a rejection that isn't really about the pool can only
+// sideline a handful of pools, and only for a while.
+const QUARANTINE_TTL_MS = 6 * 60 * 60 * 1000;
+const QUARANTINE_CAP = 20;
 // Bump to wipe persisted state on deploy (drains/stats/hypothesis/watchlists).
 // 2026-06-23: "rising" now comes from the live stream, not REST liquidity_usd;
 // the old scan_rising/scan_rugwatch snapshots and hypothesis are invalid.
@@ -189,6 +196,11 @@ interface Pending {
   alert: Alert;
   prevReserveUsd: number;
   atMs: number;
+}
+interface Quarantined {
+  chain: string;
+  reason: string;
+  t: number;
 }
 interface Gate {
   posted: Record<string, number>;
@@ -296,7 +308,10 @@ export class RadarDO {
   private thresholds = "";
   private issues: string[] = [];
   private lastReserve = new Map<string, number>();
+  // Drains awaiting confirmation. Mirrored to storage under "pending" so an
+  // eviction or redeploy inside the confirm window does not silently drop one.
   private pending = new Map<string, Pending>();
+  private pendingLoaded = false;
   private series = new Map<string, { t: number; r: number }[]>();
   private meta = new Map<string, { label: string; chain: string; token?: string }>();
   private candidates = new Map<string, Candidate>(); // discovered pools (rotation universe)
@@ -405,7 +420,7 @@ export class RadarDO {
     if (v !== SCHEMA_VERSION) {
       await this.state.storage.delete([
         "recent", "stats", "hyp_rw", "hyp_dr", "streamWatchlist", "dynamicWatchlist",
-        "scan_rising", "scan_rugwatch", "rising_snapshot",
+        "scan_rising", "scan_rugwatch", "rising_snapshot", "pending",
       ]);
       await this.state.storage.put("schema", SCHEMA_VERSION);
       this.note(`purged stale state (schema ${v ?? "none"} -> ${SCHEMA_VERSION})`);
@@ -414,6 +429,7 @@ export class RadarDO {
 
   private async ensureRunning(): Promise<void> {
     await this.purgeIfStale();
+    await this.loadPending();
     if ((await this.state.storage.getAlarm()) === null) {
       await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     }
@@ -458,8 +474,15 @@ export class RadarDO {
           }
           this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain, token });
         },
-        onFatal: (err, entries) =>
-          this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
+        onFatal: (err, entries) => {
+          this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`);
+          // An in-stream rejection pinned on an entry: keep it out of the next
+          // subscription. An HTTP refusal (status set) or a key/plan error is
+          // about the caller, so no pool is blamed for it.
+          if (err.status === undefined && !isCallerError(err.message) && entries.length <= 3) {
+            void this.quarantine(entries, err.message);
+          }
+        },
         onWarning: (msg) => this.note(msg),
         onBeat: () => {
           this.lastRawMsgMs = Date.now();
@@ -535,7 +558,48 @@ export class RadarDO {
     };
   }
 
+  // Pools the stream rejected recently, keyed by lowercased address. Expired
+  // entries are dropped on read.
+  private async quarantinedSet(): Promise<Set<string>> {
+    const q = (await this.state.storage.get<Record<string, Quarantined>>("quarantine")) ?? {};
+    const now = Date.now();
+    let expired = false;
+    for (const [addr, v] of Object.entries(q)) {
+      if (now - v.t > QUARANTINE_TTL_MS) {
+        delete q[addr];
+        expired = true;
+      }
+    }
+    if (expired) await this.state.storage.put("quarantine", q);
+    return new Set(Object.keys(q));
+  }
+
+  private async quarantine(entries: WatchEntry[], reason: string): Promise<void> {
+    const q = (await this.state.storage.get<Record<string, Quarantined>>("quarantine")) ?? {};
+    const now = Date.now();
+    for (const e of entries) {
+      const addr = e.address.toLowerCase();
+      if (!q[addr] && Object.keys(q).length >= QUARANTINE_CAP) {
+        this.note(`quarantine full (${QUARANTINE_CAP}); not holding back ${e.label ?? e.address}`);
+        continue;
+      }
+      q[addr] = { chain: e.chain, reason: reason.slice(0, 200), t: now };
+    }
+    await this.state.storage.put("quarantine", q);
+  }
+
   private async activeConfig(): Promise<RadarConfig> {
+    const config = await this.watchConfig();
+    const held = await this.quarantinedSet();
+    if (!held.size) return config;
+    const watch = config.watch.filter((w) => !held.has(w.address.toLowerCase()));
+    if (watch.length < config.watch.length) {
+      this.configSource += ` (${config.watch.length - watch.length} held back after a stream rejection)`;
+    }
+    return { ...config, watch };
+  }
+
+  private async watchConfig(): Promise<RadarConfig> {
     const apiKey = this.streamKey();
     const { minUsd, pctThreshold } = this.drainThresholds();
     if (this.env.WATCHLIST) {
@@ -998,6 +1062,7 @@ export class RadarDO {
 
     const prev = (await this.state.storage.get<WatchEntry[]>("streamWatchlist")) ?? [];
     const prevById = new Map(prev.map((w) => [w.address, w] as const));
+    const held = await this.quarantinedSet();
 
     // 1. PINS: keep every pool currently mid-move so we see its whole lifecycle.
     const targets: WatchEntry[] = [];
@@ -1005,7 +1070,7 @@ export class RadarDO {
     for (const id of this.pinnedIds()) {
       if (targets.length >= cap) break;
       const w = prevById.get(id) ?? this.entryFor(id);
-      if (w && !taken.has(w.address)) {
+      if (w && !taken.has(w.address) && !held.has(w.address.toLowerCase())) {
         targets.push(w);
         taken.add(w.address);
       }
@@ -1020,7 +1085,7 @@ export class RadarDO {
       for (let i = 0; i < ranked.length && targets.length < cap; i++) {
         scanned = i + 1;
         const c = ranked[(this.rotateCursor + i) % ranked.length];
-        if (taken.has(c.id)) continue;
+        if (taken.has(c.id) || held.has(c.id.toLowerCase())) continue;
         taken.add(c.id);
         targets.push({ method: "pool_reserves", chain: c.chain, address: c.id, label: c.label });
         filled++;
@@ -1098,41 +1163,68 @@ export class RadarDO {
       if (this.env.POST_ADDS === "1") await this.commit(alert);
       return;
     }
+    await this.loadPending();
     if (!this.pending.has(alert.subject)) {
       this.pending.set(alert.subject, { alert, prevReserveUsd: alert.prevReserveUsd, atMs: Date.now() });
+      await this.savePending();
     }
   }
 
+  // Restore drains held by a previous instance. Entries this instance already
+  // holds win; the stored copy only fills the gaps.
+  private async loadPending(): Promise<void> {
+    if (this.pendingLoaded) return;
+    const stored = (await this.state.storage.get<Record<string, Pending>>("pending")) ?? {};
+    this.pendingLoaded = true;
+    for (const [subject, p] of Object.entries(stored)) {
+      if (!this.pending.has(subject)) this.pending.set(subject, p);
+    }
+  }
+
+  private async savePending(): Promise<void> {
+    if (this.pending.size === 0) await this.state.storage.delete("pending");
+    else await this.state.storage.put("pending", Object.fromEntries(this.pending));
+  }
+
   private async resolvePending(): Promise<void> {
+    await this.loadPending();
     const now = Date.now();
     const confirmMs = envInt(this.env.DRAIN_CONFIRM_SECONDS, 90) * 1000;
     let classified = 0;
-    for (const [subject, p] of [...this.pending]) {
-      if (now - p.atMs < confirmMs) continue;
-      this.pending.delete(subject);
-      const cur = this.lastReserve.get(subject);
-      // "Held" = the reserve has not refilled most of the drained amount. Measured
-      // against the DRAIN itself, not an absolute fraction of the pre-drain size,
-      // so a small drain ($250 off a $10k pool) confirms when it sticks, instead
-      // of being wrongly suppressed for not having halved the whole pool.
-      const drainAmt = Math.abs(p.alert.deltaUsd);
-      const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
-      if (stillDrained) {
-        // Cumulative fraction of the pool gone from the pre-drain baseline to the
-        // reserve now (both known here). This, not a single frozen stream event's
-        // pct, is what tells a full rug from a partial exit. undefined when we have
-        // no current reserve -> classifyDrain must not guess "rug".
-        const completeness = cur === undefined || !(p.prevReserveUsd > 0)
-          ? undefined
-          : Math.min(Math.max(0, (p.prevReserveUsd - cur) / p.prevReserveUsd), 1);
-        // bound confirm-time lookups per cycle; a burst commits as "unknown" rather than stalling the alarm
-        const intent = classified < CLASSIFY_MAX_PER_CYCLE ? await this.classifyDrain(p.alert, completeness) : "unknown";
-        classified++;
-        await this.commit(p.alert, intent);
-      } else {
-        await this.record(p.alert, false, "suppressed: refilled");
-        await this.bumpStats({ drains: 1, suppressed: 1 });
+    let resolved = false;
+    try {
+      for (const [subject, p] of [...this.pending]) {
+        if (now - p.atMs < confirmMs) continue;
+        this.pending.delete(subject);
+        resolved = true;
+        const cur = this.lastReserve.get(subject);
+        // "Held" = the reserve has not refilled most of the drained amount. Measured
+        // against the DRAIN itself, not an absolute fraction of the pre-drain size,
+        // so a small drain ($250 off a $10k pool) confirms when it sticks, instead
+        // of being wrongly suppressed for not having halved the whole pool.
+        const drainAmt = Math.abs(p.alert.deltaUsd);
+        const stillDrained = cur === undefined ? true : cur <= p.prevReserveUsd - PERSIST_FRACTION * drainAmt;
+        if (stillDrained) {
+          // Cumulative fraction of the pool gone from the pre-drain baseline to the
+          // reserve now (both known here). This, not a single frozen stream event's
+          // pct, is what tells a full rug from a partial exit. undefined when we have
+          // no current reserve -> classifyDrain must not guess "rug".
+          const completeness = cur === undefined || !(p.prevReserveUsd > 0)
+            ? undefined
+            : Math.min(Math.max(0, (p.prevReserveUsd - cur) / p.prevReserveUsd), 1);
+          // bound confirm-time lookups per cycle; a burst commits as "unknown" rather than stalling the alarm
+          const intent = classified < CLASSIFY_MAX_PER_CYCLE ? await this.classifyDrain(p.alert, completeness) : "unknown";
+          classified++;
+          await this.commit(p.alert, intent);
+        } else {
+          await this.record(p.alert, false, "suppressed: refilled");
+          await this.bumpStats({ drains: 1, suppressed: 1 });
+        }
       }
+    } finally {
+      // Saved after the commits: an eviction mid-loop replays the entry, and the
+      // gate's per-block dedup key keeps a replay from posting twice.
+      if (resolved) await this.savePending();
     }
   }
 

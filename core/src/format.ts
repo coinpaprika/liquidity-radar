@@ -11,6 +11,26 @@ export function shortAddr(a: string): string {
   return a.length > 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
 }
 
+const ZWSP = "\u200b";
+const LABEL_MAX = 80;
+
+/**
+ * A label, chain or id that came from upstream data (token symbols are chosen
+ * by whoever deployed the token), made safe to drop into chat text: one line,
+ * bounded length, and no working mention, channel, masked-link or URL syntax.
+ * A zero-width space after "@" and "<" stops @everyone, @here, <@id>, <@&role>
+ * and <#channel>; one inside "](" and "://" stops masked links and auto-embeds.
+ */
+export function safeLabel(text: string): string {
+  let out = String(text).replace(/[\x00-\x1f\x7f\u2028\u2029]+/g, " ").trim();
+  if (out.length > LABEL_MAX) out = `${out.slice(0, LABEL_MAX - 1)}…`;
+  return out
+    .replace(/@/g, `@${ZWSP}`)
+    .replace(/</g, `<${ZWSP}`)
+    .replace(/\]\(/g, `]${ZWSP}(`)
+    .replace(/:\/\//g, `:${ZWSP}//`);
+}
+
 export function usd(n: number): string {
   const abs = Math.abs(n);
   const sign = n < 0 ? "-" : "";
@@ -37,11 +57,12 @@ export function formatAlert(a: Alert): string {
   const drain = a.kind === "drain";
   const icon = a.scope === "pool" ? (drain ? "🚨" : "🟢") : drain ? "📉" : "📈";
   const verb = a.scope === "pool" ? (drain ? "DRAIN" : "ADD") : drain ? "RESERVE DROP" : "RESERVE ADD";
-  const name = a.label ?? shortAddr(a.subject);
+  const addr = safeLabel(shortAddr(a.subject));
+  const name = a.label !== undefined ? safeLabel(a.label) : addr;
   const where = a.scope === "pool" ? "pool" : "token";
   return (
-    `${icon} ${verb} · ${name} on ${a.chain}\n` +
+    `${icon} ${verb} · ${name} on ${safeLabel(a.chain)}\n` +
     `${usd(a.deltaUsd)} (${pct(a.pct)}) · reserve now ${usd(a.reserveUsd)}\n` +
-    `${where} ${shortAddr(a.subject)} · block ${a.block}`
+    `${where} ${addr} · block ${safeLabel(a.block)}`
   );
 }

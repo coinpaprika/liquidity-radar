@@ -24,11 +24,21 @@ export const MAX_SUBSCRIPTIONS_PER_CONNECTION = 25;
  * stops and throws this instead of looping.
  */
 export class StreamFatalError extends Error {
+  /** HTTP status when the request itself was refused; unset for in-stream errors. */
   readonly status?: number;
-  constructor(message: string, status?: number) {
+  /** request_id the server attached to an in-stream error, if any. */
+  readonly requestId?: string;
+  /**
+   * The multiplexed entries the error names, when it can be pinned on them
+   * (by request_id, or by an address quoted in the message). Unset when the
+   * error does not say which entry it is about.
+   */
+  offending?: WatchEntry[];
+  constructor(message: string, status?: number, requestId?: string) {
     super(message);
     this.name = "StreamFatalError";
     this.status = status;
+    this.requestId = requestId;
   }
 }
 
@@ -190,7 +200,11 @@ async function* streamLoop(
       if (!res.body) throw new Error("stream response had no body");
 
       let healthy = false;
-      for await (const msg of parseSse(res.body)) {
+      const sseLimits = {
+        onOverflow: (what: string, n: number) =>
+          opts.onWarning?.(`dropped an oversized stream ${what} (${n} chars); resyncing on the next event`),
+      };
+      for await (const msg of parseSse(res.body, sseLimits)) {
         if (!msg.data) continue;
         if (msg.event === "error") {
           // the server closes the connection after this; deliberately BEFORE
@@ -200,7 +214,7 @@ async function* streamLoop(
             emsg = JSON.parse(msg.data)?.message ?? msg.data;
           } catch {}
           if (isRetryableStreamError(emsg)) throw new Error(`server error: ${emsg}`);
-          throw new StreamFatalError(`server error: ${emsg}`);
+          throw new StreamFatalError(`server error: ${emsg}`, undefined, msg.id);
         }
         if (!healthy) {
           healthy = true;
@@ -271,12 +285,33 @@ export interface MultiplexedEvent {
 }
 
 /**
+ * Which of a connection's entries an in-stream rejection is about: the entry at
+ * its request_id, else the entries whose address the message quotes in full,
+ * else the single entry matching an address the message shortened with an
+ * ellipsis ("ethereum/0xdead…"). Undefined when it can't be told.
+ */
+export function offendingEntries(err: StreamFatalError, entries: WatchEntry[]): WatchEntry[] | undefined {
+  if (err.status !== undefined) return undefined; // the request was refused, not one entry
+  const idx = err.requestId !== undefined && err.requestId !== "" ? Number(err.requestId) : NaN;
+  if (Number.isInteger(idx) && idx >= 0 && idx < entries.length) return [entries[idx]];
+  const text = err.message.toLowerCase();
+  const full = entries.filter((e) => e.address.length > 0 && text.includes(e.address.toLowerCase()));
+  if (full.length) return full;
+  const hits = new Set<WatchEntry>();
+  for (const m of text.matchAll(/([0-9a-z]{6,})(?:…|\.\.\.)/g)) {
+    for (const e of entries) if (e.address.toLowerCase().startsWith(m[1])) hits.add(e);
+  }
+  return hits.size === 1 ? [...hits] : undefined;
+}
+
+/**
  * Subscribe to up to 25 pools/tokens on ONE connection via POST multiplex.
  * Events are routed back to entries by request_id (the index in the POST
  * array), with a chain+address fallback. One invalid entry makes the server
  * reject the whole connection with an in-stream `error` event, which throws
  * StreamFatalError carrying the server's message (e.g. "token not found:
- * ethereum/0xdead…"), so validate entries before subscribing.
+ * ethereum/0xdead…"), with `offending` set when the error names its entry.
+ * createRadar uses that to drop the entry and keep the rest streaming.
  */
 export async function* subscribeReservesMulti(
   entries: WatchEntry[],
@@ -308,13 +343,18 @@ export async function* subscribeReservesMulti(
       }),
     opts,
   );
-  for await (const routed of stream) {
-    let idx = routed.id !== undefined ? Number(routed.id) : NaN;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= entries.length) {
-      const subject =
-        routed.event.type === "token_reserves" ? routed.event.token_id : routed.event.pool_id;
-      idx = byKey.get(`${routed.event.chain}:${subject.toLowerCase()}`) ?? -1;
+  try {
+    for await (const routed of stream) {
+      let idx = routed.id !== undefined ? Number(routed.id) : NaN;
+      if (!Number.isInteger(idx) || idx < 0 || idx >= entries.length) {
+        const subject =
+          routed.event.type === "token_reserves" ? routed.event.token_id : routed.event.pool_id;
+        idx = byKey.get(`${routed.event.chain}:${subject.toLowerCase()}`) ?? -1;
+      }
+      if (idx >= 0) yield { entryIndex: idx, event: routed.event };
     }
-    if (idx >= 0) yield { entryIndex: idx, event: routed.event };
+  } catch (err) {
+    if (err instanceof StreamFatalError) err.offending = offendingEntries(err, entries);
+    throw err;
   }
 }

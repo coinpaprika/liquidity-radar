@@ -80,3 +80,41 @@ test("value without leading space after colon is preserved", async () => {
   const msgs = await collect(streamOf("data:nospace\n\n"));
   assert.equal(msgs[0].data, "nospace");
 });
+
+test("an over-long line is dropped with its event and the next event still parses", async () => {
+  const huge = "x".repeat(2 * 1024 * 1024);
+  const msgs = await collect(
+    streamOf(`event: pool_reserves\ndata: ${huge}\n\n`, 'event: pool_reserves\ndata: {"ok":1}\n\n'),
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].data, '{"ok":1}');
+});
+
+test("an event whose data lines add up past the cap is dropped, then parsing resyncs", async () => {
+  const overflows: string[] = [];
+  const many = "data: 0123456789\n".repeat(50);
+  const out: SseMessage[] = [];
+  for await (const m of parseSse(streamOf(`event: a\n${many}\nevent: b\ndata: fine\n\n`), {
+    maxEventSize: 200,
+    onOverflow: (what) => overflows.push(what),
+  })) out.push(m);
+  assert.deepEqual(overflows, ["event"]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].event, "b");
+  assert.equal(out[0].data, "fine");
+});
+
+test("a line that never ends is cut off while streaming, not buffered forever", async () => {
+  const overflows: string[] = [];
+  const out: SseMessage[] = [];
+  const parts = ["data: "];
+  for (let i = 0; i < 20; i++) parts.push("y".repeat(100));
+  parts.push("\n\nevent: next\ndata: ok\n\n");
+  for await (const m of parseSse(streamOf(...parts), {
+    maxLineLength: 500,
+    onOverflow: (what) => overflows.push(what),
+  })) out.push(m);
+  assert.deepEqual(overflows, ["line"]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].event, "next");
+});
