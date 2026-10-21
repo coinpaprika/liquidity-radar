@@ -23,7 +23,7 @@ export {
 } from "./stream.js";
 export { detect, DEFAULT_DETECT, poolQuoteUsd, poolReserveUsd, QUOTE_TOKENS, SWAP_OFFSET_RATIO, type DetectConfig } from "./detect.js";
 export { rugScore, type RugScoreFeatures } from "./score.js";
-export { DATA_CREDIT, formatAlert, usd, pct, shortAddr } from "./format.js";
+export { DATA_CREDIT, formatAlert, safeLabel, usd, pct, shortAddr } from "./format.js";
 export { validateRadarConfig } from "./config.js";
 
 export interface RadarConfig extends Partial<DetectConfig> {

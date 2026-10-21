@@ -24,10 +24,14 @@ export function isLive(env: SinkEnv): boolean {
   return !!env.WEBHOOK_URL;
 }
 
-/** Discord webhooks want {content}; everything else gets the full payload. */
+/**
+ * Discord webhooks want {content}; everything else gets the full payload.
+ * Alert text carries upstream token symbols, so Discord is told to ping no one
+ * whatever the text says (formatAlert also defuses the syntax itself).
+ */
 export function webhookBody(url: string, text: string, alert: Alert): string {
   if (/^https:\/\/(canary\.|ptb\.)?discord(app)?\.com\/api\/webhooks\//.test(url)) {
-    return JSON.stringify({ content: text });
+    return JSON.stringify({ content: text, allowed_mentions: { parse: [] } });
   }
   return JSON.stringify({ text, alert });
 }
