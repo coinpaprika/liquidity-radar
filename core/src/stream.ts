@@ -190,7 +190,11 @@ async function* streamLoop(
       if (!res.body) throw new Error("stream response had no body");
 
       let healthy = false;
-      for await (const msg of parseSse(res.body)) {
+      const sseLimits = {
+        onOverflow: (what: string, n: number) =>
+          opts.onWarning?.(`dropped an oversized stream ${what} (${n} chars); resyncing on the next event`),
+      };
+      for await (const msg of parseSse(res.body, sseLimits)) {
         if (!msg.data) continue;
         if (msg.event === "error") {
           // the server closes the connection after this; deliberately BEFORE

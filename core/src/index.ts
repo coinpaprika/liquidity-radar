@@ -8,7 +8,7 @@ import {
 import type { Alert, ReserveEvent, WatchEntry } from "./types.js";
 
 export * from "./types.js";
-export { parseSse } from "./sse.js";
+export { parseSse, DEFAULT_MAX_EVENT_SIZE, DEFAULT_MAX_LINE_LENGTH, type SseLimits } from "./sse.js";
 export {
   DEFAULT_BASE_URL,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
