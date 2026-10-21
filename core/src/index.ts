@@ -15,6 +15,7 @@ export {
   StreamFatalError,
   coercePoolEvent,
   coerceTokenEvent,
+  offendingEntries,
   subscribeReserves,
   subscribeReservesMulti,
   type MultiplexedEvent,
@@ -49,9 +50,12 @@ export interface RadarHandlers {
   onAlert: AlertHandler;
   onEvent?: EventHandler;
   /**
-   * A subscription chunk stopped permanently: the server rejected an entry
-   * (bad chain/address/method). Not retried; fix the watchlist. Other chunks
-   * keep running.
+   * The server rejected a subscription permanently. When the rejection is about
+   * one entry (an in-stream error), `entries` is just the entry it was pinned
+   * on: the rest of its chunk has already been resubscribed without it, so drop
+   * or quarantine those entries. When the request itself was refused (an HTTP
+   * error such as a bad key), `entries` is the whole chunk, which stays down.
+   * Not retried either way. Other chunks keep running.
    */
   onFatal?: (error: StreamFatalError, entries: WatchEntry[]) => void;
   /** Server warnings / unrecognized event types. */
@@ -77,9 +81,38 @@ export interface Radar {
  * concurrent connections per IP, so ~75 entries stream from one IP; beyond that
  * the extra connections 429 and back off until a slot frees.
  *
- * Handler errors are logged and never kill a subscription. A server-rejected
- * chunk stops permanently and reports through onFatal; the rest keep running.
+ * Handler errors are logged and never kill a subscription. When the server
+ * rejects one entry of a chunk, that entry is reported through onFatal and the
+ * rest of the chunk resubscribes without it. If the error does not say which
+ * entry it is about, the chunk is split in half until the bad entry is alone,
+ * so one poisoned entry never takes its 24 neighbours down with it.
  */
+/**
+ * Errors about the caller (key, plan, permissions) are not about any entry, so
+ * splitting a chunk over one would only knock every entry out one by one.
+ */
+export function isCallerError(message: string): boolean {
+  return /auth|key|plan|forbidden|permission|denied/i.test(message);
+}
+
+/**
+ * How to carry on after an in-stream rejection: the entries to drop and the
+ * chunks to resubscribe, or null when the chunk just stops (HTTP refusal,
+ * caller error, or a chunk of one).
+ */
+function isolate(
+  err: StreamFatalError,
+  entries: WatchEntry[],
+): { bad: WatchEntry[]; rest: WatchEntry[][] } | null {
+  if (err.status !== undefined || entries.length <= 1 || isCallerError(err.message)) return null;
+  const bad = (err.offending ?? []).filter((e) => entries.includes(e));
+  if (bad.length && bad.length < entries.length) {
+    return { bad, rest: [entries.filter((e) => !bad.includes(e))] };
+  }
+  const mid = Math.ceil(entries.length / 2);
+  return { bad: [], rest: [entries.slice(0, mid), entries.slice(mid)] };
+}
+
 export function createRadar(config: RadarConfig, handlers: RadarHandlers): Radar {
   const controller = new AbortController();
   const cfg: DetectConfig = {
@@ -126,12 +159,26 @@ export function createRadar(config: RadarConfig, handlers: RadarHandlers): Radar
       }
     } catch (err) {
       if (err instanceof StreamFatalError && !controller.signal.aborted) {
-        if (handlers.onFatal) handlers.onFatal(err, entries);
-        else console.error(`[${label}] subscription stopped permanently: ${err.message}`);
+        const split = isolate(err, entries);
+        if (split) {
+          if (split.bad.length) fatal(err, split.bad, label);
+          else {
+            const msg = `${err.message}; splitting ${entries.length} subscriptions to find the rejected one`;
+            handlers.onWarning ? handlers.onWarning(msg) : console.error(`[${label}] ${msg}`);
+          }
+          await Promise.all(split.rest.filter((c) => c.length).map(runChunk));
+          return;
+        }
+        fatal(err, entries, label);
         return; // other chunks keep running
       }
       throw err;
     }
+  }
+
+  function fatal(err: StreamFatalError, entries: WatchEntry[], label: string): void {
+    if (handlers.onFatal) handlers.onFatal(err, entries);
+    else console.error(`[${label}] subscription stopped permanently: ${err.message}`);
   }
 
   return {

@@ -105,3 +105,39 @@ test("the public cache ignores the query string, so cache-busting cannot reach t
     g.caches = prev;
   }
 });
+
+test("a pool the stream rejected stays out of the next subscription, even on a new instance", async () => {
+  const state = fakeState();
+  const env = {} as any;
+  const bad = { method: "pool_reserves" as const, chain: "solana", address: "Poison11111111111111111111111111111111111111", label: "BAD" };
+  const good = Array.from({ length: 30 }, (_, i) => ({
+    method: "pool_reserves" as const, chain: "solana", address: `Good${String(i).padStart(40, "0")}`, label: `G${i}`,
+  }));
+  await state.storage.put("schema", "x");
+  await state.storage.put("streamWatchlist", [...good.slice(0, 10), bad, ...good.slice(10)]);
+
+  const first = new RadarDO(state, env) as any;
+  await first.quarantine([bad], "server error: pool not found");
+
+  const second = new RadarDO(state, env) as any; // after eviction or a recycle
+  const cfg = await second.activeConfig();
+  const addrs = cfg.watch.map((w: { address: string }) => w.address);
+  assert.ok(!addrs.includes(bad.address), "the rejected pool must not be resubscribed");
+  assert.equal(addrs.length, good.length);
+});
+
+test("a quarantine expires, so a pool is not sidelined forever", async () => {
+  const state = fakeState();
+  const bad = { method: "pool_reserves" as const, chain: "solana", address: "Poison11111111111111111111111111111111111111", label: "BAD" };
+  await state.storage.put("streamWatchlist", [bad]);
+  const t0 = Date.now();
+  const now = mock.method(Date, "now", () => t0);
+  try {
+    await (new RadarDO(state, {} as any) as any).quarantine([bad], "server error: pool not found");
+    now.mock.mockImplementation(() => t0 + 7 * 60 * 60 * 1000);
+    const cfg = await (new RadarDO(state, {} as any) as any).activeConfig();
+    assert.equal(cfg.watch.length, 1);
+  } finally {
+    now.mock.restore();
+  }
+});

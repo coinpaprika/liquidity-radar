@@ -23,6 +23,7 @@ import {
   DATA_CREDIT,
   createRadar,
   formatAlert,
+  isCallerError,
   poolReserveUsd,
   rugScore,
   QUOTE_TOKENS,
@@ -132,6 +133,12 @@ const STREAM_RISE_THRESHOLD = 0.05; // >=5% real reserve growth over the window 
 const PIN_MOVE_THRESHOLD = 0.05;
 const HYP_CAP = 800; // tracked subjects per hypothesis bucket
 const SILENCE_RESTART_MS = 150_000; // restart the subscription if it delivers NOTHING this long
+// A pool the stream rejected is kept off the watchlist this long, so a recycle
+// doesn't resubscribe it straight back into a shared connection. Bounded in
+// time and count: a rejection that isn't really about the pool can only
+// sideline a handful of pools, and only for a while.
+const QUARANTINE_TTL_MS = 6 * 60 * 60 * 1000;
+const QUARANTINE_CAP = 20;
 // Bump to wipe persisted state on deploy (drains/stats/hypothesis/watchlists).
 // 2026-06-23: "rising" now comes from the live stream, not REST liquidity_usd;
 // the old scan_rising/scan_rugwatch snapshots and hypothesis are invalid.
@@ -189,6 +196,11 @@ interface Pending {
   alert: Alert;
   prevReserveUsd: number;
   atMs: number;
+}
+interface Quarantined {
+  chain: string;
+  reason: string;
+  t: number;
 }
 interface Gate {
   posted: Record<string, number>;
@@ -462,8 +474,15 @@ export class RadarDO {
           }
           this.meta.set(subject, { label: entry.label ?? subject, chain: event.chain, token });
         },
-        onFatal: (err, entries) =>
-          this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`),
+        onFatal: (err, entries) => {
+          this.note(`subscription stopped (${entries.map((e) => e.label ?? e.address).join(", ")}): ${err.message}`);
+          // An in-stream rejection pinned on an entry: keep it out of the next
+          // subscription. An HTTP refusal (status set) or a key/plan error is
+          // about the caller, so no pool is blamed for it.
+          if (err.status === undefined && !isCallerError(err.message) && entries.length <= 3) {
+            void this.quarantine(entries, err.message);
+          }
+        },
         onWarning: (msg) => this.note(msg),
         onBeat: () => {
           this.lastRawMsgMs = Date.now();
@@ -539,7 +558,48 @@ export class RadarDO {
     };
   }
 
+  // Pools the stream rejected recently, keyed by lowercased address. Expired
+  // entries are dropped on read.
+  private async quarantinedSet(): Promise<Set<string>> {
+    const q = (await this.state.storage.get<Record<string, Quarantined>>("quarantine")) ?? {};
+    const now = Date.now();
+    let expired = false;
+    for (const [addr, v] of Object.entries(q)) {
+      if (now - v.t > QUARANTINE_TTL_MS) {
+        delete q[addr];
+        expired = true;
+      }
+    }
+    if (expired) await this.state.storage.put("quarantine", q);
+    return new Set(Object.keys(q));
+  }
+
+  private async quarantine(entries: WatchEntry[], reason: string): Promise<void> {
+    const q = (await this.state.storage.get<Record<string, Quarantined>>("quarantine")) ?? {};
+    const now = Date.now();
+    for (const e of entries) {
+      const addr = e.address.toLowerCase();
+      if (!q[addr] && Object.keys(q).length >= QUARANTINE_CAP) {
+        this.note(`quarantine full (${QUARANTINE_CAP}); not holding back ${e.label ?? e.address}`);
+        continue;
+      }
+      q[addr] = { chain: e.chain, reason: reason.slice(0, 200), t: now };
+    }
+    await this.state.storage.put("quarantine", q);
+  }
+
   private async activeConfig(): Promise<RadarConfig> {
+    const config = await this.watchConfig();
+    const held = await this.quarantinedSet();
+    if (!held.size) return config;
+    const watch = config.watch.filter((w) => !held.has(w.address.toLowerCase()));
+    if (watch.length < config.watch.length) {
+      this.configSource += ` (${config.watch.length - watch.length} held back after a stream rejection)`;
+    }
+    return { ...config, watch };
+  }
+
+  private async watchConfig(): Promise<RadarConfig> {
     const apiKey = this.streamKey();
     const { minUsd, pctThreshold } = this.drainThresholds();
     if (this.env.WATCHLIST) {
@@ -1002,6 +1062,7 @@ export class RadarDO {
 
     const prev = (await this.state.storage.get<WatchEntry[]>("streamWatchlist")) ?? [];
     const prevById = new Map(prev.map((w) => [w.address, w] as const));
+    const held = await this.quarantinedSet();
 
     // 1. PINS: keep every pool currently mid-move so we see its whole lifecycle.
     const targets: WatchEntry[] = [];
@@ -1009,7 +1070,7 @@ export class RadarDO {
     for (const id of this.pinnedIds()) {
       if (targets.length >= cap) break;
       const w = prevById.get(id) ?? this.entryFor(id);
-      if (w && !taken.has(w.address)) {
+      if (w && !taken.has(w.address) && !held.has(w.address.toLowerCase())) {
         targets.push(w);
         taken.add(w.address);
       }
@@ -1024,7 +1085,7 @@ export class RadarDO {
       for (let i = 0; i < ranked.length && targets.length < cap; i++) {
         scanned = i + 1;
         const c = ranked[(this.rotateCursor + i) % ranked.length];
-        if (taken.has(c.id)) continue;
+        if (taken.has(c.id) || held.has(c.id.toLowerCase())) continue;
         taken.add(c.id);
         targets.push({ method: "pool_reserves", chain: c.chain, address: c.id, label: c.label });
         filled++;
